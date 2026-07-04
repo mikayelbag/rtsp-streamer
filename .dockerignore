@@ -1,0 +1,7 @@
+video_samples/
+workspace/
+__pycache__/
+mediamtx
+README.md
+TECHNICAL.md
+docker-compose.yaml

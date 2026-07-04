@@ -1,0 +1,7 @@
+mediamtx
+workspace/
+video_samples/
+__pycache__/
+*.log
+.idea/
+.claude/

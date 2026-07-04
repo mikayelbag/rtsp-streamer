@@ -1,0 +1,24 @@
+services:
+  streamer:
+    image: mikayelbag/rtsp-streamer:latest
+    container_name: rtsp_streamer
+    restart: unless-stopped
+    # Host networking: the streamer binds the first free port from
+    # 41000/41001/41002, so up to 3 instances run side by side —
+    # copy this service block and change container_name + folders.
+    network_mode: host
+    # No tty needed: the image runs the streamer on its own pseudo-terminal
+    # (ptyrun.py), so the animated progress bar works under `compose up` as-is.
+    environment:
+      # prod = progress ticker + stream URLs only (details in workspace/streamer.log)
+      # dev  = full logs on stdout, no ticker
+      MODE: prod
+    # ADVERTISE_IP and the open-file limit are baked into the image.
+    volumes:
+      - ./video_samples:/app/video_samples:ro   # put source videos here
+      - ./workspace:/app/workspace              # transcode cache + streamer.log
+      # Config DIRECTORY (not a single file): on first run the image drops a
+      # default config.ini in here. Edit ./config/config.ini and restart to
+      # customise. Mounting a folder avoids Docker's single-file-bind footgun
+      # (a missing source path silently becomes a directory).
+      - ./config:/app/config
