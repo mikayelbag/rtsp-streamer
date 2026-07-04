@@ -1,10 +1,16 @@
-<!-- This file is the Docker Hub overview. Push it with: ./dockerhub.sh push-readme -->
+<!-- Shared README: shown on GitHub and pushed to Docker Hub as the repo
+     overview with: ./dockerhub.sh push-readme -->
 
 # RTSP Streamer
 
+[![CI](https://github.com/mikayelbag/rtsp-streamer/actions/workflows/ci.yml/badge.svg)](https://github.com/mikayelbag/rtsp-streamer/actions/workflows/ci.yml)
 [![Docker Image Version](https://img.shields.io/docker/v/mikayelbag/rtsp-streamer?sort=semver&label=docker%20hub)](https://hub.docker.com/r/mikayelbag/rtsp-streamer)
 [![Image Size](https://img.shields.io/docker/image-size/mikayelbag/rtsp-streamer/latest)](https://hub.docker.com/r/mikayelbag/rtsp-streamer)
 [![Docker Pulls](https://img.shields.io/docker/pulls/mikayelbag/rtsp-streamer)](https://hub.docker.com/r/mikayelbag/rtsp-streamer)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+**Image:** [`mikayelbag/rtsp-streamer`](https://hub.docker.com/r/mikayelbag/rtsp-streamer) ·
+**Source:** [github.com/mikayelbag/rtsp-streamer](https://github.com/mikayelbag/rtsp-streamer)
 
 **Turn a folder of videos into looping live RTSP streams** — a self-contained test
 source for benchmarking video-analytics engines. Point your engine
@@ -247,8 +253,8 @@ already make a restarted recorder resume its playlist correctly.
 - **Healthcheck** — the container reports healthy while preparing and once the
   bound RTSP port accepts connections; a crashed streamer flips it unhealthy.
 
-Deep-dive documentation of every internal mechanism lives in `TECHNICAL.md`
-in the project source.
+Deep-dive documentation of every internal mechanism lives in
+[`TECHNICAL.md`](https://github.com/mikayelbag/rtsp-streamer/blob/main/TECHNICAL.md).
 
 
 ---

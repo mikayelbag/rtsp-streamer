@@ -5,3 +5,5 @@ mediamtx
 README.md
 TECHNICAL.md
 docker-compose.yaml
+.github/
+.git/

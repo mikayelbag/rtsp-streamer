@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax
+        run: python3 -m py_compile streamer.py loader.py probe_feeder.py ptyrun.py
+      - name: Shell syntax
+        run: |
+          sh -n entrypoint.sh
+          bash -n dockerhub.sh
+
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t rtsp-streamer:ci .
+
+      - name: Install ffmpeg (host-side probe)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Generate test video
+        run: |
+          mkdir -p video_samples/ids workspace config
+          ffmpeg -hide_banner -loglevel error -f lavfi -t 6 \
+            -i testsrc2=size=640x360:rate=30 \
+            -c:v libx264 -preset veryfast -pix_fmt yuv420p \
+            video_samples/ids/smoke.mp4
+
+      - name: Run container
+        run: |
+          docker run -d --name streamer --network host \
+            -v "$PWD/video_samples:/app/video_samples:ro" \
+            -v "$PWD/workspace:/app/workspace" \
+            -v "$PWD/config:/app/config" \
+            rtsp-streamer:ci
+
+      - name: Wait for stream and probe it
+        run: |
+          for i in $(seq 1 60); do
+            port=$(cat workspace/.port 2>/dev/null || true)
+            if [ -n "$port" ] && nc -z 127.0.0.1 "$port"; then break; fi
+            sleep 2
+          done
+          port=$(cat workspace/.port)
+          echo "RTSP port: $port"
+          # retry: the port opens before the publisher is confirmed
+          for i in $(seq 1 15); do
+            out=$(ffprobe -v error -rtsp_transport tcp -select_streams v:0 \
+              -show_entries stream=codec_name,width,height -of csv=p=0 \
+              "rtsp://127.0.0.1:${port}/ids/smoke" 2>/dev/null) && break
+            sleep 2
+          done
+          echo "stream: $out"
+          echo "$out" | grep -q '^h264,640,360$'
+
+      - name: Pull 3 seconds of frames
+        run: |
+          port=$(cat workspace/.port)
+          ffmpeg -hide_banner -v error -rtsp_transport tcp \
+            -i "rtsp://127.0.0.1:${port}/ids/smoke" -t 3 -f null -
+
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          docker logs streamer || true
+          cat workspace/streamer.log || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f streamer || true
