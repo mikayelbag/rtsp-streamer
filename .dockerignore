@@ -7,3 +7,4 @@ TECHNICAL.md
 docker-compose.yaml
 .github/
 .git/
+tests/

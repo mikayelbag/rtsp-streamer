@@ -20,11 +20,13 @@ It writes one frame per 1/fps tick, paced by an absolute clock:
     exactly once;
   - then back to black.
 
-Signal = an mtime edge on --signal-file (`touch workspace/start`). No deletion,
-so multiple feeders share one file with no race; each fires once per touch and
-re-arms automatically. Phase is already baked into the content file (it starts at
-its shift frame), so the feeders only need to start it at roughly the same time —
-a ~50 ms poll is plenty.
+Signal = an mtime edge on any --signal-file (repeatable). streamer.py passes
+two per stream: the shared `workspace/start` (fires every probe at once) and
+the stream's own `workspace/start_<folder>_<name>` (fires just this camera).
+No deletion, so multiple feeders share the global file with no race; each
+fires once per touch and re-arms automatically. Phase is already baked into
+the content file (it starts at its shift frame), so the feeders only need to
+start it at roughly the same time — a ~50 ms poll is plenty.
 """
 
 import argparse
@@ -141,8 +143,12 @@ class ContentStream:
             return item
         return self.queue.get()
 
-    def close(self, kill=False):
-        if kill and self.proc.poll() is None:
+    def close(self):
+        # always terminate a still-live decoder: at natural end-of-content it
+        # has already exited, and in the abnormal case (pump died early) a
+        # polite wait() would stall the tick loop up to 5 s — a visible gap
+        # in the feed
+        if self.proc.poll() is None:
             self.proc.terminate()
         try:
             self.proc.stdout.close()
@@ -164,7 +170,9 @@ def main():
     ap.add_argument("--x264-params", required=True,
                     help="x264 param string from streamer.py (X264_PARAMS)")
     ap.add_argument("--preset", default="veryfast")
-    ap.add_argument("--signal-file", required=True)
+    ap.add_argument("--signal-file", action="append", required=True,
+                    dest="signal_files",
+                    help="fire on an mtime edge of any of these (repeatable)")
     args = ap.parse_args()
 
     frame_bytes = args.width * args.height * 3 // 2
@@ -173,8 +181,8 @@ def main():
     poll_every = max(1, int(round(0.05 / period)))   # check the signal ~20x/s
 
     sink = start_sink(args)
-    # arm against the signal's current state: only a *newer* touch fires us
-    last_fire = signal_mtime(args.signal_file)
+    # arm against each signal's current state: only a *newer* touch fires us
+    last_fire = {p: signal_mtime(p) for p in args.signal_files}
 
     content = None          # ContentStream while playing content once
     next_tick = time.monotonic()
@@ -185,10 +193,17 @@ def main():
                 break       # streamer.py will restart us
 
             # fire on an mtime edge (a touch newer than the last one we saw)
+            # on any signal file; simultaneous edges (global + own touched
+            # together) are absorbed into one replay
             if content is None and tick % poll_every == 0:
-                m = signal_mtime(args.signal_file)
-                if m is not None and (last_fire is None or m > last_fire):
-                    last_fire = m
+                fire = False
+                for p in args.signal_files:
+                    m = signal_mtime(p)
+                    last = last_fire.get(p)
+                    if m is not None and (last is None or m > last):
+                        last_fire[p] = m
+                        fire = True
+                if fire:
                     content = ContentStream(args, frame_bytes)
 
             frame = None
@@ -217,7 +232,7 @@ def main():
                 next_tick = time.monotonic()   # fell far behind: resync clock
     finally:
         if content is not None:
-            content.close(kill=True)
+            content.close()
         if sink.poll() is None:
             try:
                 sink.stdin.close()

@@ -3,7 +3,8 @@ FROM alpine:3.20
 ARG MEDIAMTX_VERSION=1.12.2
 ARG TARGETARCH=amd64
 
-RUN apk add --no-cache python3 ffmpeg ca-certificates curl \
+# font-dejavu: the concat chain burns an index number into each video (drawtext)
+RUN apk add --no-cache python3 ffmpeg font-dejavu ca-certificates curl \
  && curl -fL "https://github.com/bluenviron/mediamtx/releases/download/v${MEDIAMTX_VERSION}/mediamtx_v${MEDIAMTX_VERSION}_linux_${TARGETARCH}.tar.gz" \
     | tar -xz -C /usr/local/bin mediamtx \
  && apk del curl
@@ -45,8 +46,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 
 # OCI metadata — shows up on Docker Hub / `docker inspect`.
 LABEL org.opencontainers.image.title="RTSP Streamer" \
-      org.opencontainers.image.description="Serve every video in a folder as a looping live RTSP stream — for benchmarking video-analytics engines. MediaMTX + ffmpeg, probe mode, mini-clip mode, phase-shifted camera simulation." \
-      org.opencontainers.image.version="2.4.0" \
+      org.opencontainers.image.description="Serve every video in a folder as a looping live RTSP stream — for benchmarking video-analytics engines. MediaMTX + ffmpeg, probe mode, mini-clip mode, concat chains, phase-shifted camera simulation." \
+      org.opencontainers.image.version="2.5.0" \
       org.opencontainers.image.licenses="MIT"
 
 ENTRYPOINT ["/app/entrypoint.sh"]

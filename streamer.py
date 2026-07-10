@@ -33,7 +33,17 @@ Features on top of the bare ffmpeg command:
                    (phase-shifted) content once and returns to black, re-armed
   - mini mode:     short-clip 1-minute loop = first frame frozen 10s + clip +
                    black; composes with probe (fire -> black -> frozen -> clip
-                   -> black)
+                   -> black). Mini streams mount as numbers (/mini/1, /mini/2,
+                   ...) — with many clips the URL is the index; the number ->
+                   source map is written to workspace/<folder>/manifest.txt
+  - concat mode:   every video in a `concat = true` folder becomes one chained
+                   stream: [first frame frozen 3s][clip][last frame frozen 3s]
+                   [2s black] per video, normalised to one size/fps, each
+                   video's 1-based index burned into its top-left corner.
+                   manifest.txt maps index -> source file + start offset
+  - per-camera probe fire: each probe stream also has its own signal file
+                   (workspace/start_<folder>_<name>), so one camera can be
+                   fired without firing all of them
   - port fallback: first free port from the configured list is used, so
                    several instances can share one host
   - parallel prepare: independent videos are prepared by a small worker pool,
@@ -66,7 +76,7 @@ import traceback
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 SIGNAL_FILE = "start"       # touch workspace/start to fire armed probe streams
 PORT_FILE = ".port"         # bound RTSP port, written for the Docker healthcheck
 X264_PRESET = "veryfast"
@@ -95,6 +105,11 @@ def _set_keyint(n):
 _set_keyint(60)
 MINI_FREEZE_S = 10          # mini: hold the first frame this many seconds
 MINI_LOOP_S = 60            # mini: total regular-mode loop (freeze + clip + black)
+CONCAT_FREEZE_S = 3         # concat: freeze first/last frame this many seconds
+CONCAT_GAP_S = 2            # concat: black gap between videos
+CONCAT_DEFAULT_SIZE = "1920x1080"   # concat normalisation targets used when
+CONCAT_DEFAULT_FPS = "30"           # the folder's size/fps are left at "keep"
+MANIFEST_NAME = "manifest.txt"      # index -> source map (mini & concat folders)
 ALLOWED_CODECS = {"h264", "hevc"}
 VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v")
 RESTART_BACKOFF_START = 2.0
@@ -103,6 +118,7 @@ STABLE_RESET_SECONDS = 60.0
 WATCHDOG_POLL_SECONDS = 5.0   # how often the supervisor samples the mediamtx API
 STALL_SECONDS = 15.0          # live publisher, no bytes into mediamtx this long -> restart it
 READY_WAIT_SECONDS = 15.0     # max wait for all streams to publish before the URL banner
+LOG_MAX_BYTES = 5 * 1024 * 1024   # rotate streamer.log past this size (one .1 kept)
 
 DEV = (os.environ.get("MODE") or "prod").strip().lower() == "dev"
 LOG_FH = None  # opened in main() once the workspace exists (prod mode)
@@ -126,7 +142,10 @@ def say(msg=""):
 # ---------------------------------------------------------------- config ----
 
 SETTING_KEYS = ("copies", "shift_frames", "fps", "size", "bitrate_kbps", "probe",
-                "force_reencode", "mini", "camera_grade")
+                "force_reencode", "mini", "concat", "camera_grade")
+
+BOOL_KEYS = ("probe", "force_reencode", "mini", "concat", "camera_grade")
+BOOL_WORDS = ("1", "true", "yes", "on", "0", "false", "no", "off")
 
 
 def load_config(path):
@@ -140,7 +159,63 @@ def load_config(path):
     cfg.read(path)
     if not cfg.has_section("streamer"):
         sys.exit("Config must have a [streamer] section: {}".format(path))
+    validate_config(cfg)
     return cfg
+
+
+def validate_config(cfg):
+    """Fail fast, at startup, with a clear message on any malformed value.
+    Previously a bad int surfaced as a mid-prepare traceback inside a worker
+    thread (stream silently lost), and a malformed `size` was silently
+    ignored by transcode()."""
+    for sec in cfg.sections():
+        if sec != "streamer" and not sec.startswith(("folder:", "video:")):
+            continue
+        for key in SETTING_KEYS:
+            if not cfg.has_option(sec, key):
+                continue
+            v = cfg.get(sec, key).strip()
+            if not v:
+                continue
+            err = None
+            if key in ("copies", "shift_frames"):
+                if not re.fullmatch(r"-?\d+", v):
+                    err = "must be an integer"
+            elif key in BOOL_KEYS:
+                if v.lower() not in BOOL_WORDS:
+                    err = "must be a boolean (true/false)"
+            elif key == "fps":
+                if v.lower() != "keep":
+                    try:
+                        ok = float(v) > 0
+                    except ValueError:
+                        ok = False
+                    if not ok:
+                        err = "must be 'keep' or a positive number"
+            elif key == "size":
+                if v.lower() != "keep" and not re.fullmatch(r"\d+x\d+", v.lower()):
+                    err = "must be 'keep' or WIDTHxHEIGHT (e.g. 1920x1080)"
+            elif key == "bitrate_kbps":
+                if v.lower() != "keep" and not re.fullmatch(r"\d+", v):
+                    err = "must be 'keep' or an integer (kbps)"
+            if err:
+                sys.exit("Config error: [{}] {} = {} — {}".format(sec, key, v, err))
+
+
+def parse_ports(raw):
+    """[streamer] ports -> list of ints, or a clean startup error. A typo'd
+    port previously surfaced as a bare int() traceback."""
+    ports = []
+    for tok in raw.replace(" ", "").split(","):
+        if not tok:
+            continue
+        if not re.fullmatch(r"\d+", tok) or not 1 <= int(tok) <= 65535:
+            sys.exit("Config error: ports must be comma-separated port numbers "
+                     "1-65535 (got: {})".format(raw))
+        ports.append(int(tok))
+    if not ports:
+        sys.exit("Config error: ports is empty")
+    return ports
 
 
 def apply_section(cfg, sec, s):
@@ -154,7 +229,7 @@ def apply_section(cfg, sec, s):
             continue
         if key in ("copies", "shift_frames"):
             s[key] = int(v)
-        elif key in ("probe", "force_reencode", "mini", "camera_grade"):
+        elif key in BOOL_KEYS:
             s[key] = v.lower() in ("1", "true", "yes", "on")
         else:
             s[key] = v.lower()
@@ -171,7 +246,11 @@ def settings_for(cfg, folder, stem):
         "probe": False,
         "force_reencode": False,
         "mini": False,
-        "camera_grade": True,
+        "concat": False,
+        # default OFF since 2.5.0: sources with B-frames / long GOP are served
+        # as-is (fast first run, (!) marker in the banner); set true to force
+        # strict real-camera H.264 everywhere
+        "camera_grade": False,
     }
     apply_section(cfg, "streamer", s)
     apply_section(cfg, "folder:{}".format(folder), s)
@@ -240,9 +319,9 @@ def needs_transcode(path, setts, info):
     """(reasons, warnings) for this source. Reasons force a re-encode
     (compatibility: settings, unreadable, non-h264/hevc codec — no real
     camera or engine speaks e.g. MPEG-4 Part 2 over RTSP). Camera-realism
-    findings (B-frames / long GOP — see X264_PARAMS) are reasons too by
-    default, but with camera_grade=false they demote to warnings: the source
-    is served as-is and its URL gets a (!) marker in the banner instead."""
+    findings (B-frames / long GOP — see X264_PARAMS) are reasons only with
+    camera_grade=true; by default (false since 2.5.0) they are warnings: the
+    source is served as-is and its URL gets a (!) marker in the banner."""
     reasons, warns = [], []
     if setts["force_reencode"]:
         reasons.append("forced")
@@ -326,6 +405,21 @@ def _rm(path):
         pass
 
 
+def _pid_alive(pid):
+    """True when a process with this pid exists (signal 0 probes without
+    touching it). Used by the startup temp sweep to leave another live
+    instance's in-progress .part files alone."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True     # exists but not ours (EPERM) — leave it alone
+
+
 def _tmp_for(dst):
     """Build outputs land in a temp file that is atomically renamed into place
     on success. A build killed mid-write (e.g. docker stop during a first-run
@@ -339,7 +433,7 @@ def _tmp_for(dst):
 STAMP_SUFFIX = ".meta"
 
 
-def _stamp(dst, warn=None):
+def _stamp(dst, warn=None, extra=None):
     """Record next to the artifact how it was built (streamer version +
     keyint). The stamp is what lets is_fresh() trust a cached file without
     re-running the packet-index scan on every startup, and what detects a
@@ -351,6 +445,8 @@ def _stamp(dst, warn=None):
     meta = {"version": VERSION, "keyint": KEYINT}
     if warn:
         meta["warn"] = warn
+    if extra:
+        meta.update(extra)
     try:
         with open(dst + STAMP_SUFFIX, "w", encoding="utf-8") as f:
             json.dump(meta, f)
@@ -467,8 +563,9 @@ def frame_count(path):
 
 def _keyframe_times(path):
     """pts_time of each keyframe, read from the packet index (no decode).
-    Empty list on any failure (incl. timeout) — callers fall back to a full
-    re-encode instead of crashing the whole streamer."""
+    Empty list on any failure (incl. timeout) — _gop_too_long() then reports
+    no issue, so an unscannable file is remuxed as-is instead of crashing
+    the whole streamer (its cadence is unknown, not known-bad)."""
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_packets",
@@ -639,6 +736,149 @@ def build_mini(src, dst, info, with_tail_black):
     return True
 
 
+# --------------------------------------------------------------- concat -----
+
+def find_font():
+    """A bold TTF for the concat index overlay, or None (drawtext then falls
+    back to fontconfig's default; the Docker image ships font-dejavu)."""
+    for p in ("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",            # alpine
+              "/usr/share/fonts/ttf-dejavu/DejaVuSans-Bold.ttf",        # old alpine
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",   # debian
+              "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"):              # arch
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def build_concat_segment(src, dst, index, w, h, fps):
+    """One chain segment: [first frame frozen CONCAT_FREEZE_S] + clip +
+    [last frame frozen CONCAT_FREEZE_S] + [CONCAT_GAP_S black], normalised to
+    w x h @ fps (letterboxed, aspect kept) with the 1-based index burned into
+    the top-left corner. drawtext sits *before* the tpads, so both frozen
+    frames carry the number while the appended black gap stays clean. One
+    uniform X264_PARAMS encode per segment -> the chain is joined with a pure
+    stream-copy and loops like any other prepared file."""
+    fs = max(24, h // 15)
+    draw = ("drawtext={}text='{}':x=24:y=24:fontsize={}:fontcolor=white:"
+            "borderw={}:bordercolor=black").format(
+        "fontfile={}:".format(find_font()) if find_font() else "",
+        index, fs, max(2, fs // 24))
+    vf = ("scale={w}:{h}:force_original_aspect_ratio=decrease,"
+          "pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps={fps},format=yuv420p,{draw},"
+          "tpad=start_duration={fz}:start_mode=clone"
+          ":stop_duration={fz}:stop_mode=clone,"
+          "tpad=stop_duration={gap}:stop_mode=add:color=black").format(
+              w=w, h=h, fps=fps, draw=draw,
+              fz=CONCAT_FREEZE_S, gap=CONCAT_GAP_S)
+    tmp = _tmp_for(dst)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+           "-i", src, "-vf", vf,
+           "-c:v", "libx264", "-preset", X264_PRESET,
+           "-x264-params", X264_PARAMS,
+           "-pix_fmt", "yuv420p", "-an", "-f", "mpegts", tmp]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        log("concat segment FAILED for {}: {}".format(src, (r.stderr or "").strip()[-400:]))
+        _rm(tmp)
+        return False
+    _commit(tmp, dst)
+    return True
+
+
+def prepare_concat(cfg, workspace, folder, items):
+    """Concat folder (`concat = true`): all its videos chain into ONE stream,
+    mounted at /<folder>/chain. Per video: first frame frozen CONCAT_FREEZE_S
+    s -> the clip -> last frame frozen CONCAT_FREEZE_S s -> CONCAT_GAP_S s of
+    black -> next. Segments are normalised to one size/fps (the folder's
+    size/fps settings; 1920x1080 @ 30 when left at "keep") so mixed sources
+    join cleanly; each carries its index in the top-left corner. The index ->
+    source map, with every segment's start offset inside the loop, is written
+    to workspace/<folder>/manifest.txt — know the number, find the video.
+
+    items = ordered [(src, stem)]. Segments cache individually (index, size
+    and fps are in the artifact name, is_fresh covers keyint/mtime); the
+    joined chain caches on a stamp listing its segment set. copies /
+    shift_frames don't apply (one composite stream); probe does."""
+    setts = settings_for(cfg, folder, "")
+    size = setts["size"] if setts["size"] != "keep" else CONCAT_DEFAULT_SIZE
+    fps_s = setts["fps"] if setts["fps"] != "keep" else CONCAT_DEFAULT_FPS
+    w, h = (int(v) for v in size.split("x", 1))
+    fps = float(fps_s)
+    if setts["copies"] > 1 or setts["shift_frames"]:
+        log("concat folder {}: copies/shift_frames ignored (one chained stream)"
+            .format(folder))
+    out_dir = os.path.join(workspace, folder)
+    os.makedirs(out_dir, exist_ok=True)
+
+    segs = []                              # (index, src, seg_path)
+    for i, (src, stem) in enumerate(items, 1):
+        seg = os.path.join(out_dir, "{}__seg{}_{}x{}_f{}.ts".format(
+            stem, i, w, h, fps_s))
+        if is_fresh(seg, src, setts, check_grade=False):
+            log("cached: {}".format(seg))
+        elif not build_concat_segment(src, seg, i, w, h, fps):
+            continue                       # bad video skipped; its number stays reserved
+        segs.append((i, src, seg))
+    if not segs:
+        log("concat folder {}: no usable videos".format(folder))
+        return [], []
+
+    chain = os.path.join(out_dir, "__chain__.ts")   # "__" can't clash with a
+                                                    # sanitized stem
+    seg_names = [os.path.basename(s) for _, _, s in segs]
+    meta = _read_stamp(chain)
+    fresh = (not setts["force_reencode"]
+             and os.path.isfile(chain)
+             and meta is not None
+             and meta.get("keyint") == KEYINT
+             and meta.get("segments") == seg_names
+             and os.path.getmtime(chain) >= max(
+                 os.path.getmtime(s) for _, _, s in segs))
+    if fresh:
+        log("cached: {}".format(chain))
+    else:
+        listf = chain + ".concat"
+        with open(listf, "w", encoding="utf-8") as f:
+            for _, _, s in segs:
+                f.write("file '{}'\n".format(os.path.abspath(s)))
+        tmp = _tmp_for(chain)
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+             "-f", "concat", "-safe", "0", "-i", listf,
+             "-c", "copy", "-an", "-f", "mpegts", tmp],
+            capture_output=True, text=True)
+        _rm(listf)
+        if r.returncode != 0:
+            log("concat join FAILED for {}: {}".format(
+                chain, (r.stderr or "").strip()[-400:]))
+            _rm(tmp)
+            return [], []
+        os.replace(tmp, chain)
+        _stamp(chain, extra={"segments": seg_names})
+
+    # manifest: number -> start offset in the loop, duration, source file.
+    # Rebuilt only with the chain (frame_count scans the segment indexes).
+    man = os.path.join(out_dir, MANIFEST_NAME)
+    if not fresh or not os.path.isfile(man):
+        off = 0.0
+        lines = ["# index  start(s)  length(s)  source"]
+        for i, src, seg in segs:
+            n = frame_count(seg)
+            dur = n / fps if n else 0.0
+            lines.append("{:>5}  {:>8.1f}  {:>9.1f}  {}".format(i, off, dur, src))
+            off += dur
+        try:
+            with open(man, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except OSError:
+            pass
+
+    mount = "/{}/chain".format(folder)
+    if setts["probe"]:
+        return [], [(mount, chain, w, h, fps)]
+    return [(mount, chain, [])], []
+
+
 # --------------------------------------------------------------- probe ------
 #
 # Probe mode streams a black screen until `touch workspace/start`, then plays the
@@ -709,26 +949,34 @@ def publish_cmd(src, url):
             "-f", "rtsp", "-rtsp_transport", "tcp", url]
 
 
-def feeder_cmd(content, url, w, h, fps, signal_path):
-    """Probe feeder: black until `touch signal_path`, then content once, repeat
-    (one continuous publish session — see probe_feeder.py)."""
+def feeder_cmd(content, url, w, h, fps, signal_paths):
+    """Probe feeder: black until any of signal_paths is touched, then content
+    once, repeat (one continuous publish session — see probe_feeder.py).
+    Two signal files per stream: the shared global one (fires every probe at
+    once) and the stream's own (fires just this camera — no cross-talk)."""
     feeder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_feeder.py")
-    return [sys.executable, feeder,
-            "--content", content, "--url", url,
-            "--width", str(w), "--height", str(h),
-            "--fps", str(fps), "--x264-params", X264_PARAMS,
-            "--preset", X264_PRESET, "--signal-file", signal_path]
+    cmd = [sys.executable, feeder,
+           "--content", content, "--url", url,
+           "--width", str(w), "--height", str(h),
+           "--fps", str(fps), "--x264-params", X264_PARAMS,
+           "--preset", X264_PRESET]
+    for sp in signal_paths:
+        cmd += ["--signal-file", sp]
+    return cmd
 
 
 # -------------------------------------------------------------- prepare -----
 
-def prepare_source(cfg, workspace, src, folder, stem):
+def prepare_source(cfg, workspace, src, folder, stem, mount_stem=None):
     """Prepare one source video end-to-end (transcode/remux, mini composite,
     rotation body, forward-rotated copies) and return its streams as
     (publishers [(mount, file, warns)], feeders [(mount, file, w, h, fps)]).
     warns lists realism issues kept in an as-is file (camera_grade=false) —
     surfaced as a (!) marker on the URL banner. Touches only this video's
-    workspace files — independent videos can be prepared in parallel."""
+    workspace files — independent videos can be prepared in parallel.
+    mount_stem overrides the RTSP mount name only (mini numbering); workspace
+    artifacts stay named by the real stem, so a reordered library never
+    serves a cached artifact under the wrong number."""
     pubs, feeders = [], []
     setts = settings_for(cfg, folder, stem)
     if setts["copies"] <= 0:
@@ -788,6 +1036,8 @@ def prepare_source(cfg, workspace, src, folder, stem):
     # mini reshapes the whole clip (freeze + clip + black), so phase shift
     # is meaningless for it — bypass the rotation machinery.
     if setts["mini"]:
+        if shift:
+            log("mini ignores shift_frames: {}".format(src))
         shift = 0
     nframes = frame_count(play_path) if shift > 0 and copies > 1 else 0
     if shift > 0 and copies > 1 and not nframes:
@@ -832,9 +1082,10 @@ def prepare_source(cfg, workspace, src, folder, stem):
         elif not _full_reencode(play_path, body, cut_frames):
             body = None   # body build failed -> copies fall back to no shift
 
+    mname = mount_stem or stem
     for i in range(copies):
-        mount = ("/{}/{}".format(folder, stem) if i == 0
-                 else "/{}/{}_{}".format(folder, stem, i + 1))
+        mount = ("/{}/{}".format(folder, mname) if i == 0
+                 else "/{}/{}_{}".format(folder, mname, i + 1))
         # mini composite when built, else the untouched original (copy 0)
         src_file = mini_content or play_path
         k = (i * shift) % nframes if (nframes and body) else 0
@@ -989,7 +1240,7 @@ def main():
                   or os.path.join(base, get("videos", "video_samples")))
     workspace = (os.environ.get("WORKSPACE_DIR", "").strip()
                  or os.path.join(base, get("workspace", "workspace")))
-    ports = [int(p) for p in get("ports", "41000,41001,41002").replace(" ", "").split(",") if p]
+    ports = parse_ports(get("ports", "41000,41001,41002"))
     transport = get("transport", "tcp").lower()
     advertise = (os.environ.get("ADVERTISE_IP", "").strip()
                  or get("advertise_ip", "")
@@ -1014,13 +1265,27 @@ def main():
     mediamtx_bin = find_mediamtx()
     os.makedirs(workspace, exist_ok=True)
     if not DEV:
-        LOG_FH = open(os.path.join(workspace, "streamer.log"), "a", encoding="utf-8")
+        log_path = os.path.join(workspace, "streamer.log")
+        # cap growth across restarts: the log is append-only and also receives
+        # every stream process's stderr, so a long-lived container would
+        # otherwise fill the workspace volume. One rotated generation
+        # (streamer.log.1) keeps the tail of the previous history.
+        try:
+            if os.path.getsize(log_path) > LOG_MAX_BYTES:
+                os.replace(log_path, log_path + ".1")
+        except OSError:
+            pass
+        LOG_FH = open(log_path, "a", encoding="utf-8")
 
     # sweep temp build files a killed previous run may have left behind, and
-    # the previous run's port file so the healthcheck can't probe a stale port
+    # the previous run's port file so the healthcheck can't probe a stale port.
+    # Temps whose pid suffix belongs to a live process are another instance's
+    # in-progress builds (shared workspace) — deleting those would corrupt
+    # its prepare mid-write, so they are skipped.
     for d, _, files in os.walk(workspace):
         for f in files:
-            if re.search(r"\.part\d+$", f):
+            m = re.search(r"\.part(\d+)$", f)
+            if m and not _pid_alive(int(m.group(1))):
                 _rm(os.path.join(d, f))
     _rm(os.path.join(workspace, PORT_FILE))
 
@@ -1067,6 +1332,51 @@ def main():
         taken.add((folder, stem))
         jobs.append((src, folder, stem))
 
+    # partition: concat folders chain all their videos into one stream (one
+    # job per folder); mini videos mount as numbers (/mini/1, /mini/2, ... in
+    # scan order — with many clips the URL is the index, not a long filename).
+    # Each numbered/concat folder gets a workspace/<folder>/manifest.txt
+    # mapping index -> source, so a number always leads back to its video.
+    concat_folders = {}          # folder -> ordered [(src, stem)]
+    mini_index = {}              # folder -> ordered [(idx, src)]
+    counters = {}
+    plain_jobs = []              # (src, folder, stem, mount_stem)
+    for src, folder, stem in jobs:
+        setts = settings_for(cfg, folder, stem)
+        if setts["concat"]:
+            if setts["mini"]:
+                log("concat wins over mini for {}".format(src))
+            concat_folders.setdefault(folder, []).append((src, stem))
+            continue
+        mount_stem = None
+        if setts["mini"]:
+            idx = counters.get(folder, 0) + 1
+            counters[folder] = idx
+            mount_stem = str(idx)
+            mini_index.setdefault(folder, []).append((idx, src))
+        plain_jobs.append((src, folder, stem, mount_stem))
+
+    for folder, entries in mini_index.items():
+        mdir = os.path.join(workspace, folder)
+        os.makedirs(mdir, exist_ok=True)
+        try:
+            with open(os.path.join(mdir, MANIFEST_NAME), "w", encoding="utf-8") as f:
+                f.write("# index  mount  source\n")
+                for idx, src in entries:
+                    f.write("{:>5}  /{}/{}  {}\n".format(idx, folder, idx, src))
+        except OSError:
+            pass
+
+    tasks = []                   # (display_name, zero-arg prepare callable)
+    for src, folder, stem, mount_stem in plain_jobs:
+        tasks.append(("{}/{}".format(folder, mount_stem or stem),
+                      (lambda s=src, f=folder, t=stem, m=mount_stem:
+                       prepare_source(cfg, workspace, s, f, t, mount_stem=m))))
+    for folder in sorted(concat_folders):
+        tasks.append(("{}/chain".format(folder),
+                      (lambda f=folder, it=concat_folders[folder]:
+                       prepare_concat(cfg, workspace, f, it))))
+
     # prepare in parallel: each video's work is independent and lives in
     # ffmpeg subprocesses, so a small thread pool cuts first-run startup on
     # multi-video sets (cached runs are quick either way). ex.map keeps the
@@ -1077,32 +1387,31 @@ def main():
     done_lock = threading.Lock()
 
     if anim is not None:
-        loader.set_items(["{}/{}".format(f, s) for _, f, s in jobs])
+        loader.set_items([name for name, _ in tasks])
 
-    def run_job(job):
-        src, folder, stem = job
-        name = "{}/{}".format(folder, stem)
+    def run_job(task):
+        name, fn = task
         if anim is not None:
             loader.item_start(name)
         try:
-            res = prepare_source(cfg, workspace, src, folder, stem)
+            res = fn()
         except Exception:
-            log("prepare FAILED for {}: {}".format(src, traceback.format_exc().strip()))
+            log("prepare FAILED for {}: {}".format(name, traceback.format_exc().strip()))
             res = ([], [])
         with done_lock:
             done[0] += 1
             if anim is not None:
                 loader.item_done(name)
             elif not DEV:
-                bar = (loader.snapshot(done[0], len(jobs)) if loader is not None
-                       else "prepared {}/{}".format(done[0], len(jobs)))
-                say(" {}  {}/{}".format(bar, folder, stem))
+                bar = (loader.snapshot(done[0], len(tasks)) if loader is not None
+                       else "prepared {}/{}".format(done[0], len(tasks)))
+                say(" {}  {}".format(bar, name))
         return res
 
-    workers = max(1, min(4, os.cpu_count() or 1, len(jobs)))
+    workers = max(1, min(4, os.cpu_count() or 1, len(tasks)))
     try:
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            results = list(ex.map(run_job, jobs))
+            results = list(ex.map(run_job, tasks))
     finally:
         if anim is not None:
             loader.stop(anim)
@@ -1115,13 +1424,15 @@ def main():
 
     proc_out = None if DEV else LOG_FH
 
-    # clear any stale signal from a previous run so probe streams start armed
+    # clear stale signals (global + per-stream) from a previous run so probe
+    # streams start armed
     signal_path = os.path.join(workspace, SIGNAL_FILE)
-    if os.path.exists(signal_path):
-        try:
-            os.remove(signal_path)
-        except OSError:
-            pass
+    try:
+        for f in os.listdir(workspace):
+            if f == SIGNAL_FILE or f.startswith(SIGNAL_FILE + "_"):
+                _rm(os.path.join(workspace, f))
+    except OSError:
+        pass
 
     # -- start mediamtx on the first free port from the configured list.
     # One config file per port: mediamtx hot-reloads its config when the file
@@ -1184,7 +1495,7 @@ def main():
 
     # mount -> argv; "publish" loops a TS, "feeder" runs probe_feeder.py
     stream_cmds = {}
-    pub_mounts, feeder_mounts = [], []   # pub_mounts: (mount, warns)
+    pub_mounts, feeder_mounts = [], []   # (mount, warns) / (mount, own signal)
     for mount, fpath, warns in publishers:
         mount = unique_mount(mount)
         url = "rtsp://127.0.0.1:{}{}".format(port, mount)
@@ -1193,8 +1504,14 @@ def main():
     for mount, fpath, w, h, fps in probe_feeders:
         mount = unique_mount(mount)
         url = "rtsp://127.0.0.1:{}{}".format(port, mount)
-        stream_cmds[mount] = feeder_cmd(fpath, url, w, h, fps, signal_path)
-        feeder_mounts.append(mount)
+        # per-stream signal alongside the global one: touch workspace/start
+        # fires every probe (as before), touch workspace/start_<f>_<name>
+        # fires just this camera
+        own_sig = "{}_{}".format(SIGNAL_FILE, mount[1:].replace("/", "_"))
+        stream_cmds[mount] = feeder_cmd(
+            fpath, url, w, h, fps,
+            [signal_path, os.path.join(workspace, own_sig)])
+        feeder_mounts.append((mount, own_sig))
 
     procs = {}  # mount -> {proc, backoff, started, retry_at, bytes, bytes_ts}
     for mount, cmd in stream_cmds.items():
@@ -1230,11 +1547,15 @@ def main():
             any_warn = True
             mark = "  (! {})".format(", ".join(warn_text.get(w, w) for w in warns))
         say("  rtsp://{}:{}{}{}".format(advertise, port, mount, mark))
-    for mount in feeder_mounts:
-        say("  rtsp://{}:{}{}  (probe — black until: touch workspace/{})".format(
-            advertise, port, mount, SIGNAL_FILE))
+    for mount, own_sig in feeder_mounts:
+        say("  rtsp://{}:{}{}  (probe — fire: touch workspace/{} | all: touch workspace/{})".format(
+            advertise, port, mount, own_sig, SIGNAL_FILE))
     if any_warn:
         say("  (!) served as-is — clients joining mid-stream may glitch briefly")
+    man_folders = sorted(set(mini_index) | set(concat_folders))
+    if man_folders:
+        say("  index maps: " + ", ".join(
+            "workspace/{}/{}".format(f, MANIFEST_NAME) for f in man_folders))
     say("─────────────────────────────────────────────")
 
     last_watch = 0.0
