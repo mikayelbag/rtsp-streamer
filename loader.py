@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loader — docker-compose-pull-style progress display for prod mode.
+"""Loader — docker-pull-style progress display for prod mode.
 
                  ⠸ rtsp-streamer [⣿⣿⣿⣿⣿⣿⣷⠀⠀⠀] 2/5 Preparing      11.5s
                    ✔ ids/first Ready                                  3.5s
@@ -15,11 +15,15 @@ Usage:
     loader.stop(handle)
 
 Design notes:
-  - The display emulates `docker compose pull`: a header line with a
-    braille bar and overall counts, then one line per video with its own
-    state mark (`-` waiting, spinner while preparing, `✔` when ready) and
-    a right-aligned elapsed time that ticks while running and freezes on
-    completion — exactly the layer-list rhythm of a compose pull.
+  - The display emulates `docker pull`: a header line with a braille bar
+    and overall counts, then one line per video with its own state mark
+    (`-` waiting, spinner while preparing, `✔` when ready) and a
+    right-aligned elapsed time that ticks while running and freezes on
+    completion — exactly the layer-list rhythm of a pull. Every video
+    keeps its own line for the whole run (the list never collapses), so
+    ✔ lines accumulate down the screen the way `Pull complete` lines do.
+    Like docker pull, a list taller than the viewer's terminal can smear
+    the in-place redraw — accepted trade-off for the full vertical list.
   - The whole block is indented INDENT columns. Under `docker compose up`
     ordinary log lines carry the `rtsp_streamer  | ` service prefix
     (17 columns) while the loader's in-place redraws bypass the prefixer
@@ -38,15 +42,14 @@ Design notes:
     any TTY (direct run with piped output, CI) streamer.py skips the
     animation and prints append-only snapshot lines via snapshot().
   - Redraw is in place (\\r + erase-to-EOL per line, cursor-up between
-    frames); stop() erases the block, leaving clean scrollback, and a
-    blank spacer line is printed first so the block sits visually apart
-    from surrounding prefixed lines. If the terminal *narrows* mid-run
-    the old block may have wrapped (cursor-up counts would lie), so it
-    is abandoned in place and a fresh block starts below — resize-safe.
-    Terminals narrower than the block fall back to a one-line spinner.
-  - Long item lists collapse: finished videos fold into one `✔ N ready`
-    line and pending ones into `… N waiting`, keeping the block height
-    bounded (the pty is only 24 rows).
+    frames); stop() draws one final frame and leaves the block in the
+    scrollback — like the layer list a `docker pull` leaves behind — and
+    a blank spacer line is printed first so the block sits visually
+    apart from surrounding prefixed lines. If the terminal *narrows*
+    mid-run the old block may have wrapped (cursor-up counts would lie),
+    so it is abandoned in place and a fresh block starts below —
+    resize-safe. Terminals narrower than the block fall back to a
+    one-line spinner.
   - The cursor is hidden while running and always restored (finally:).
 """
 
@@ -75,7 +78,6 @@ FPS = 12
 INDENT = 17                   # parks the block right of compose's
                               # `rtsp_streamer  | ` prefix (17 columns)
 MIN_FULL_COLS = INDENT + 44   # narrower than this -> one-line fallback
-MAX_ROWS = 12                 # item lines shown before collapsing
 # animation rates, in dots (eighth-cells) per frame:
 CATCHUP_FRAC = 0.25           # fraction of the gap to real progress closed per frame
 CREEP = 0.10                  # idle forward creep
@@ -200,14 +202,10 @@ def _frame_lines(tick, t0, cols):
                   mark=TICK if finished else spin,
                   mcolor=GREEN if finished else CYAN)]
 
-    # item rows, docker-compose-pull style; collapse when the list is long
-    runs = [n for n in items if state[n][0] == ST_RUN]
-    waits = [n for n in items if state[n][0] == ST_WAIT]
-    collapse = total > MAX_ROWS
+    # item rows, docker-pull style: every video keeps its own line for the
+    # whole run — ✔ lines pile up vertically like `Pull complete` lines
     for n in items:
         st, ts, te = state[n]
-        if collapse and st != ST_RUN:
-            continue
         if st == ST_DONE:
             lines.append(_row("{}  {} {} Ready".format(ind, TICK, n),
                               _elapsed(te - ts), w, mark=TICK, mcolor=GREEN))
@@ -216,14 +214,6 @@ def _frame_lines(tick, t0, cols):
                               _elapsed(now - ts), w, mark=spin, mcolor=CYAN))
         else:
             lines.append(_row("{}  {} {} Waiting".format(ind, WAIT_MARK, n),
-                              "", w, dim=True))
-    if collapse:
-        ndone = total - len(runs) - len(waits)
-        if ndone:
-            lines.append(_row("{}  {} {} ready".format(ind, TICK, ndone),
-                              "", w, mark=TICK, mcolor=GREEN))
-        if waits:
-            lines.append(_row("{}  … {} waiting".format(ind, len(waits)),
                               "", w, dim=True))
     return lines
 
@@ -274,20 +264,53 @@ def _run(ev):
                     out.write("\r" + EL)
                 for l in lines:
                     out.write("\r" + EL + l + "\n")
-                if prev > len(lines):     # block shrank (list collapsed)
+                if prev > len(lines):     # block shrank (set_items changed)
                     out.write("\033[J")
                 drew = len(lines) + 1     # sentinel: >1 means block mode
             out.flush()
             tick += 1
             ev.wait(1.0 / FPS)
     finally:
-        # erase whatever we drew, leaving clean scrollback
-        if drew > 1:
-            out.write("\033[{}A\r\033[J".format(drew - 1))
-        elif drew == 1:
-            out.write("\r" + EL)
-        out.write(RESET + SHOW_CURSOR)
-        out.flush()
+        # docker-pull style: draw one final frame and leave the block in
+        # the scrollback — the ✔ list stays as the record of what was
+        # prepared, like the layer list a pull leaves behind. The narrow
+        # one-line fallback finalizes as a single plain line; an empty
+        # item list just erases (nothing worth keeping).
+        try:
+            with _lock:
+                total = len(_items)
+                done = sum(1 for n in _items if _state[n][0] == ST_DONE)
+            cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+            if drew and last_cols is not None and cols < last_cols:
+                # narrowed since the last frame: never climb over possibly
+                # wrapped lines — abandon the old block, draw fresh below
+                out.write("\r\033[J")
+                drew = 0
+            if total == 0:
+                if drew > 1:
+                    out.write("\033[{}A\r\033[J".format(drew - 1))
+                elif drew == 1:
+                    out.write("\r" + EL)
+            elif cols < MIN_FULL_COLS:
+                if drew > 1:
+                    out.write("\033[{}A\r\033[J".format(drew - 1))
+                mark = TICK if done >= total else WAIT_MARK
+                out.write("\r" + EL + "{} prepared {}/{}\n".format(
+                    mark, done, total))
+            else:
+                lines = _frame_lines(tick, t0, cols)
+                prev = drew - 1 if drew > 1 else 0
+                if prev:
+                    out.write("\033[{}A".format(prev))
+                elif drew == 1:
+                    out.write("\r" + EL)
+                for l in lines:
+                    out.write("\r" + EL + l + "\n")
+                if prev > len(lines):
+                    out.write("\033[J")
+        finally:
+            out.write(RESET + SHOW_CURSOR)
+            out.flush()
 
 
 def start(subtitle=""):
