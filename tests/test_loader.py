@@ -94,42 +94,43 @@ class TestRow(unittest.TestCase):
         loader._row("some long name here", "10.5s", 5)
 
 
-class TestBoundedBlock(unittest.TestCase):
-    """Finished units scroll away as one-shot ✔ lines; the animated block
-    stays a handful of lines no matter how many videos there are."""
+class TestDockerPullBlock(unittest.TestCase):
+    """docker-pull layout: summary header is always the block's first line,
+    below it one fixed row per folder that changes state in place."""
 
-    def test_block_bounded_and_done_scrolls(self):
-        names = ["f/v{}".format(i) for i in range(30)]
+    def test_header_first_one_row_per_folder(self):
+        names = ["ids/v{}".format(i) for i in range(30)]
+        names += ["tfa/cam", "concat/chain"]
         loader.set_items(names)
         for n in names[:10]:
             loader.item_start(n)
             loader.item_done(n)
-        loader.item_start(names[10])
-        perm, block = loader._frame(0, time.monotonic(), 80)
-        plain_perm = [ANSI.sub("", l) for l in perm]
-        plain_block = [ANSI.sub("", l) for l in block]
-        self.assertEqual(len(perm), 10)              # one ✔ line per done
-        self.assertTrue(all("Ready" in l for l in plain_perm))
-        # block: header + 1 running + waiting count — never one per video
-        self.assertEqual(len(block), 3)
-        self.assertIn("10/30", plain_block[0])
-        self.assertIn(names[10], plain_block[1])
-        self.assertIn("19 waiting", plain_block[2])
+        loader.item_start("ids/v10")
+        block = loader._frame(0, time.monotonic(), 80)
+        plain = [ANSI.sub("", l) for l in block]
+        # header + ids + tfa + concat — never one line per video
+        self.assertEqual(len(block), 4)
+        self.assertIn("10/32", plain[0])                 # summary stays on top
+        self.assertIn("ids 10/30 Preparing v10", plain[1])
+        self.assertIn("tfa Waiting", plain[2])
+        self.assertIn("concat Waiting", plain[3])
+        self.assertTrue(all(l.startswith("rtsp_streamer  | ")
+                            for l in plain))             # gutter on every line
 
-    def test_done_lines_emit_once(self):
-        loader.set_items(["a", "b"])
-        loader.item_start("a")
-        loader.item_done("a")
-        perm1, _ = loader._frame(0, time.monotonic(), 80)
-        perm2, _ = loader._frame(1, time.monotonic(), 80)
-        self.assertEqual(len(perm1), 1)
-        self.assertEqual(perm2, [])                  # already scrolled away
+    def test_rows_change_state_in_place(self):
+        loader.set_items(["a/one", "a/two", "b/one"])
+        block0 = loader._frame(0, time.monotonic(), 80)
+        for n in ("a/one", "a/two"):
+            loader.item_start(n)
+            loader.item_done(n)
+        block1 = loader._frame(1, time.monotonic(), 80)
+        self.assertEqual(len(block0), len(block1))       # nothing scrolls away
+        plain = [ANSI.sub("", l) for l in block1]
+        self.assertIn("2/3", plain[0])                   # header still first
+        self.assertIn("a Ready (2 videos)", plain[1])    # ✔ in its own row
+        self.assertIn("b Waiting", plain[2])
 
-
-class TestGrouping(unittest.TestCase):
-    """Numbered mini mounts share one row and one final first…last line."""
-
-    def test_group_single_row_then_final_range(self):
+    def test_group_row_counts_then_final_count(self):
         items = [("mini/{}".format(i), "mini") for i in range(1, 66)]
         items.append(("tfa/cam", None))
         loader.set_items(items)
@@ -137,19 +138,27 @@ class TestGrouping(unittest.TestCase):
             loader.item_start("mini/{}".format(i))
             loader.item_done("mini/{}".format(i))
         loader.item_start("mini/13")
-        perm, block = loader._frame(0, time.monotonic(), 80)
-        self.assertEqual(perm, [])       # group unfinished: nothing scrolls
+        block = loader._frame(0, time.monotonic(), 80)
         plain = [ANSI.sub("", l) for l in block]
-        self.assertEqual(len(block), 3)  # header + group row + waiting
+        self.assertEqual(len(block), 3)  # header + mini row + tfa row
         self.assertIn("mini 12/65 Preparing", plain[1])
-        self.assertIn("1 waiting", plain[2])
+        self.assertNotIn("Preparing 13", plain[1])       # grouped: no name
         for i in range(13, 66):
             loader.item_start("mini/{}".format(i))
             loader.item_done("mini/{}".format(i))
-        perm, _ = loader._frame(1, time.monotonic(), 80)
-        self.assertEqual(len(perm), 1)   # 65 clips -> ONE scrolled line
-        self.assertIn("mini/1 … mini/65 Ready (65 clips)",
-                      ANSI.sub("", perm[0]))
+        block = loader._frame(1, time.monotonic(), 80)
+        plain = [ANSI.sub("", l) for l in block]
+        self.assertEqual(len(block), 3)
+        self.assertIn("mini Ready (65 clips)", plain[1])
+
+    def test_short_terminal_collapses_waiting_rows(self):
+        loader.set_items(["f{}/v".format(i) for i in range(30)])
+        loader.item_start("f0/v")
+        block = loader._frame(0, time.monotonic(), 80, rows=10)
+        plain = [ANSI.sub("", l) for l in block]
+        self.assertLessEqual(len(block), 8)              # fits rows-2
+        self.assertIn("folders Waiting", plain[-1])
+        self.assertIn("f0", plain[1])                    # active row kept
 
 
 class TestPersistedFinalFrame(unittest.TestCase):
@@ -176,12 +185,13 @@ class TestPersistedFinalFrame(unittest.TestCase):
             loader.item_start(n)
             loader.item_done(n)
         out = self._run_finalized()
-        self.assertIn("a/one", out)
-        self.assertIn("a/two", out)
+        plain = ANSI.sub("", out)
+        self.assertIn("a Ready (2 videos)", plain)
+        self.assertIn("2/2 Ready", plain)
         self.assertIn(loader.TICK, out)
         self.assertTrue(out.endswith(loader.SHOW_CURSOR))
-        plain = ANSI.sub("", out)
-        self.assertEqual(sum("Ready" in l for l in plain.splitlines()), 3)
+        # header + folder row, both ✔ — the whole block stays put
+        self.assertEqual(sum("Ready" in l for l in plain.splitlines()), 2)
 
     def test_no_items_leaves_nothing(self):
         loader.set_items([])
