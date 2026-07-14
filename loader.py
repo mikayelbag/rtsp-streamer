@@ -1,35 +1,39 @@
 #!/usr/bin/env python3
 """Loader — docker-pull-style progress display for prod mode.
 
-                 ⠸ rtsp-streamer [⣿⣿⣿⣿⣿⣿⣷⠀⠀⠀] 2/5 Preparing      11.5s
                    ✔ ids/first Ready                                  3.5s
-                   ✔ ids/seconds Ready                                7.1s
-                   ⠸ ids/third Preparing                              9.4s
-                   - tfa/dalma_fhd Waiting
+                   ✔ mini/1 … mini/65 Ready (65 clips)               41.2s
+                 ⠸ rtsp-streamer v2.5.0 [⣿⣿⣿⣿⣿⣷⠀⠀⠀] 66/68 Preparing 51.4s
+                   ⠸ tfa/dalma_fhd Preparing                          9.4s
+                   - 1 waiting
 
 Usage:
-    handle = loader.start(subtitle="v2.4.0")
-    loader.set_items(["ids/first", "ids/seconds", ...])   # once, ordered
-    loader.item_start("ids/first")                        # worker began it
-    loader.item_done("ids/first")                         # worker finished it
+    handle = loader.start(subtitle="v2.5.0")
+    loader.set_items([("ids/first", None), ("mini/1", "mini"), ...])
+    loader.item_start("mini/1")                           # worker began it
+    loader.item_done("mini/1")                            # worker finished it
     loader.stop(handle)
 
 Design notes:
-  - The display emulates `docker pull`: a header line with a braille bar
-    and overall counts, then one line per video with its own state mark
-    (`-` waiting, spinner while preparing, `✔` when ready) and a
-    right-aligned elapsed time that ticks while running and freezes on
-    completion — exactly the layer-list rhythm of a pull. Every video
-    keeps its own line for the whole run (the list never collapses), so
-    ✔ lines accumulate down the screen the way `Pull complete` lines do.
-    Like docker pull, a list taller than the viewer's terminal can smear
-    the in-place redraw — accepted trade-off for the full vertical list.
+  - The display emulates `docker pull`: finished videos print ONCE as plain
+    scrolling ✔ lines (they land in the scrollback exactly like `Pull
+    complete` lines), while the small animated block below holds only the
+    header bar, the rows currently in flight (at most the worker-pool
+    width) and a dim `- N waiting` count. The block is therefore a handful
+    of lines tall no matter how many videos there are — it always fits the
+    terminal, the cursor-up redraw can never clamp at the screen top and
+    smear, and it never climbs over earlier (compose-prefixed) log lines.
+  - Grouping: set_items entries may carry a group key. All members of a
+    group share ONE row (`⠸ mini 12/65 Preparing`) and ONE final line
+    (`✔ mini/1 … mini/65 Ready (65 clips)`) — numbered mini mounts differ
+    only by index, so first…last says everything and the per-index map
+    stays in workspace/<folder>/manifest.txt.
   - The whole block is indented INDENT columns. Under `docker compose up`
     ordinary log lines carry the `rtsp_streamer  | ` service prefix
-    (17 columns) while the loader's in-place redraws bypass the prefixer
-    and land at the left margin; the indent parks the block just right of
-    that prefix column so it reads as part of the log flow instead of
-    cutting into it. On a bare terminal it's a harmless offset.
+    (17 columns) while the loader's writes bypass the prefixer and land at
+    the left margin; the indent parks the block just right of that prefix
+    column so it reads as part of the log flow instead of cutting into it.
+    On a bare terminal it's a harmless offset.
   - The bar fills at *dot* resolution (8 braille dots per cell) and
     *moves* docker-pull style: each frame the displayed fill crawls
     toward the real done/total position, and while a slow build holds
@@ -42,14 +46,14 @@ Design notes:
     any TTY (direct run with piped output, CI) streamer.py skips the
     animation and prints append-only snapshot lines via snapshot().
   - Redraw is in place (\\r + erase-to-EOL per line, cursor-up between
-    frames); stop() draws one final frame and leaves the block in the
-    scrollback — like the layer list a `docker pull` leaves behind — and
-    a blank spacer line is printed first so the block sits visually
-    apart from surrounding prefixed lines. If the terminal *narrows*
-    mid-run the old block may have wrapped (cursor-up counts would lie),
-    so it is abandoned in place and a fresh block starts below —
-    resize-safe. Terminals narrower than the block fall back to a
-    one-line spinner.
+    frames). Newly finished units are written first — they overwrite the
+    top of the old block and push the fresh block down, which is exactly
+    how they end up scrolled "above" it. stop() paints one final frame,
+    leaving the ✔ list and the closing header line in the scrollback. If
+    the terminal *narrows* mid-run the old block may have wrapped
+    (cursor-up counts would lie), so it is abandoned in place and a fresh
+    block starts below — resize-safe. Terminals narrower than the block
+    fall back to a one-line spinner.
   - The cursor is hidden while running and always restored (finally:).
 """
 
@@ -86,18 +90,34 @@ CREEP_CAP = 0.9               # creep may cover at most 90% of the current video
 ST_WAIT, ST_RUN, ST_DONE = 0, 1, 2
 
 _lock = threading.Lock()
-_items = []                   # ordered display names
-_state = {}                   # name -> [state, t_start, t_end]
+_units = []                   # ordered display units: {label, members, group}
+_state = {}                   # member name -> [state, t_start, t_end]
+_emitted = set()              # unit indexes already printed as final ✔ lines
 _subtitle = ""
 
 
-def set_items(names):
-    """Declare the full ordered list of videos (all start as Waiting)."""
+def set_items(entries):
+    """Declare the full ordered list of videos (all start as Waiting).
+    Each entry is a name or a (name, group) pair; entries sharing a group
+    collapse into one display row and one final ✔ line (first … last)."""
     with _lock:
-        _items[:] = [str(n) for n in names]
+        _units[:] = []
         _state.clear()
-        for n in _items:
-            _state[n] = [ST_WAIT, None, None]
+        _emitted.clear()
+        by_group = {}
+        for e in entries:
+            name, group = (e, None) if isinstance(e, str) else (e[0], e[1])
+            name = str(name)
+            _state[name] = [ST_WAIT, None, None]
+            if group is None:
+                _units.append({"label": name, "members": [name], "group": False})
+            else:
+                u = by_group.get(group)
+                if u is None:
+                    u = {"label": str(group), "members": [], "group": True}
+                    by_group[group] = u
+                    _units.append(u)
+                u["members"].append(name)
 
 
 def item_start(name):
@@ -179,135 +199,178 @@ def _row(left, elapsed, w, mark=None, mcolor=None, dim=False):
     return left + tail
 
 
-def _frame_lines(tick, t0, cols):
+def _unit_view(u, state):
+    """(state, done, total, first_start, last_end) for one display unit."""
+    sts = [state[n] for n in u["members"]]
+    done = sum(1 for s in sts if s[0] == ST_DONE)
+    started = [s[1] for s in sts if s[1] is not None]
+    ended = [s[2] for s in sts if s[2] is not None]
+    st = (ST_DONE if done == len(sts)
+          else ST_RUN if started else ST_WAIT)
+    return (st, done, len(sts),
+            min(started) if started else None,
+            max(ended) if ended else None)
+
+
+def _done_row(u, view, w, ind):
+    """The permanent ✔ line a finished unit leaves in the scrollback."""
+    _, _, total, ts, te = view
+    if u["group"] and total > 1:
+        left = "{}  {} {} … {} Ready ({} clips)".format(
+            ind, TICK, u["members"][0], u["members"][-1], total)
+    else:
+        left = "{}  {} {} Ready".format(ind, TICK, u["members"][0])
+    return _row(left, _elapsed(te - ts), w, mark=TICK, mcolor=GREEN)
+
+
+def _frame(tick, t0, cols):
+    """One frame -> (perm_lines, block_lines).
+
+    perm  = units that finished since the last frame, printed once and
+            left to scroll away (docker pull's `Pull complete` lines).
+    block = the small in-place animated part: header bar, one row per
+            in-flight unit (bounded by the worker-pool width, so a
+            handful at most) and a dim waiting count."""
     with _lock:
-        items = list(_items)
-        state = {n: list(_state[n]) for n in items}
+        units = [dict(u, members=list(u["members"])) for u in _units]
+        state = {n: list(_state[n]) for n in _state}
         subtitle = _subtitle
+        emitted = set(_emitted)
     now = time.monotonic()
     spin = SPINNER[tick % len(SPINNER)]
     w = cols - 1
     ind = " " * INDENT
 
-    done = sum(1 for n in items if state[n][0] == ST_DONE)
-    total = len(items)
+    views = [_unit_view(u, state) for u in units]
+    done = sum(v[1] for v in views)
+    total = sum(v[2] for v in views)
+
+    perm, newly = [], []
+    for i, (u, v) in enumerate(zip(units, views)):
+        if v[0] == ST_DONE and i not in emitted:
+            perm.append(_done_row(u, v, w, ind))
+            newly.append(i)
+    if newly:
+        with _lock:
+            _emitted.update(newly)
 
     # header: spinner, name, bar, counts, verb, total elapsed on the right
     finished = total > 0 and done >= total
-    fill, track = _bar_at(BAR_W * 8 if finished else _frame_lines.shown)
+    fill, track = _bar_at(BAR_W * 8 if finished else _frame.shown)
     head = "{}{} rtsp-streamer {} [{}{}] {}/{} {}".format(
         ind, TICK if finished else spin, subtitle, fill, track,
         done, total, "Ready" if finished else "Preparing")
-    lines = [_row(head, _elapsed(now - t0), w,
+    block = [_row(head, _elapsed(now - t0), w,
                   mark=TICK if finished else spin,
                   mcolor=GREEN if finished else CYAN)]
 
-    # item rows, docker-pull style: every video keeps its own line for the
-    # whole run — ✔ lines pile up vertically like `Pull complete` lines
-    for n in items:
-        st, ts, te = state[n]
-        if st == ST_DONE:
-            lines.append(_row("{}  {} {} Ready".format(ind, TICK, n),
-                              _elapsed(te - ts), w, mark=TICK, mcolor=GREEN))
-        elif st == ST_RUN:
-            lines.append(_row("{}  {} {} Preparing".format(ind, spin, n),
+    waiting = 0
+    for u, v in zip(units, views):
+        st, d, t, ts, _ = v
+        if st == ST_RUN:
+            label = ("{} {}/{}".format(u["label"], d, t) if u["group"]
+                     else u["label"])
+            block.append(_row("{}  {} {} Preparing".format(ind, spin, label),
                               _elapsed(now - ts), w, mark=spin, mcolor=CYAN))
+        elif st == ST_WAIT:
+            waiting += t
+    if waiting:
+        block.append(_row("{}  {} {} waiting".format(ind, WAIT_MARK, waiting),
+                          "", w, dim=True))
+    return perm, block
+
+
+_frame.shown = 0.0            # displayed bar fill in dots (animated)
+
+
+def _paint(out, tick, t0, drew, last_cols, final=False):
+    """Draw one frame in place; returns the new (drew, last_cols).
+    `drew` > 1 means a block of drew-1 lines is on screen; 1 means the
+    narrow one-line spinner; 0 means nothing to climb over."""
+    with _lock:
+        total = len(_state)
+        done = sum(1 for n in _state if _state[n][0] == ST_DONE)
+    _frame.shown = _advance(_frame.shown, done, total)
+    cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+    buf = []
+    if drew and last_cols is not None and cols < last_cols:
+        # terminal narrowed: the old block's lines may have wrapped, so
+        # cursor-up counts no longer match physical lines — never climb
+        # over them. Abandon the old block (it stays as one stale frame)
+        # and draw a fresh one below.
+        buf.append("\r\033[J")
+        drew = 0
+    last_cols = cols
+
+    if total == 0:
+        if final:                 # nothing worth keeping: just erase
+            if drew > 1:
+                buf.append("\033[{}A\r\033[J".format(drew - 1))
+            elif drew == 1:
+                buf.append("\r" + EL)
+            drew = 0
         else:
-            lines.append(_row("{}  {} {} Waiting".format(ind, WAIT_MARK, n),
-                              "", w, dim=True))
-    return lines
-
-
-_frame_lines.shown = 0.0      # displayed bar fill in dots (animated)
+            text = "\r{}{}{} preparing".format(
+                CYAN, SPINNER[tick % len(SPINNER)], RESET)
+            buf.append(text[:cols] + EL)
+            drew = 1
+    elif cols < MIN_FULL_COLS:    # one-line fallback
+        perm, _ = _frame(tick, t0, cols)   # still flush finished units
+        if drew > 1:              # leaving block mode: erase block
+            buf.append("\033[{}A\r\033[J".format(drew - 1))
+        elif drew == 1:
+            buf.append("\r" + EL)
+        for l in perm:
+            buf.append("\r" + EL + l + "\n")
+        if final:
+            mark = TICK if done >= total else WAIT_MARK
+            buf.append("\r" + EL + "{} prepared {}/{}\n".format(
+                mark, done, total))
+            drew = 0
+        else:
+            line = "\r{}{}{} preparing {}/{}".format(
+                CYAN, SPINNER[tick % len(SPINNER)], RESET, done, total)
+            buf.append(line[:cols] + EL)
+            drew = 1
+    else:
+        perm, block = _frame(tick, t0, cols)
+        prev = drew - 1 if drew > 1 else 0
+        if prev:                  # climb back to the block's top
+            buf.append("\033[{}A".format(prev))
+        elif drew == 1:           # leaving one-line mode
+            buf.append("\r" + EL)
+        # finished lines first: they overwrite the old block's top and the
+        # fresh block reprints below — that is how they scroll "above" it
+        for l in perm + block:
+            buf.append("\r" + EL + l + "\n")
+        if prev > len(perm) + len(block):   # block shrank: erase leftovers
+            buf.append("\033[J")
+        # final frame stays put in the scrollback (docker-pull style): the
+        # ✔ list plus the closing header line are the record of the run
+        drew = 0 if final else len(block) + 1
+    out.write("".join(buf))
+    out.flush()
+    return drew, last_cols
 
 
 def _run(ev):
     out = sys.stdout
     t0 = time.monotonic()
     tick = 0
-    drew = 0                              # block lines currently on screen
+    drew = 0                              # see _paint
     last_cols = None
-    _frame_lines.shown = 0.0
+    _frame.shown = 0.0
     # a blank spacer line first, so the animated block sits visually apart
     # from surrounding (compose-prefixed) log lines instead of touching them
     out.write("\n" + HIDE_CURSOR)
     try:
         while not ev.is_set():
-            with _lock:
-                total = len(_items)
-                done = sum(1 for n in _items if _state[n][0] == ST_DONE)
-            _frame_lines.shown = _advance(_frame_lines.shown, done, total)
-            cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-            if drew and last_cols is not None and cols < last_cols:
-                # terminal narrowed: the old block's lines may have wrapped,
-                # so cursor-up counts no longer match physical lines — never
-                # climb over them. Abandon the old block (it stays as one
-                # stale frame) and draw a fresh one below.
-                out.write("\r\033[J")
-                drew = 0
-            last_cols = cols
-            if cols < MIN_FULL_COLS:      # one-line fallback
-                if drew > 1:              # leaving block mode: erase block
-                    out.write("\033[{}A\r\033[J".format(drew - 1))
-                text = ("preparing {}/{}".format(done, total)
-                        if total > 0 else "preparing")
-                line = "\r{}{}{} {}".format(
-                    CYAN, SPINNER[tick % len(SPINNER)], RESET, text)
-                out.write(line[:cols] + EL)
-                drew = 1
-            else:
-                lines = _frame_lines(tick, t0, cols)
-                prev = drew - 1 if drew > 1 else 0
-                if prev:                  # climb back to the block's top
-                    out.write("\033[{}A".format(prev))
-                elif drew == 1:           # leaving one-line mode
-                    out.write("\r" + EL)
-                for l in lines:
-                    out.write("\r" + EL + l + "\n")
-                if prev > len(lines):     # block shrank (set_items changed)
-                    out.write("\033[J")
-                drew = len(lines) + 1     # sentinel: >1 means block mode
-            out.flush()
+            drew, last_cols = _paint(out, tick, t0, drew, last_cols)
             tick += 1
             ev.wait(1.0 / FPS)
     finally:
-        # docker-pull style: draw one final frame and leave the block in
-        # the scrollback — the ✔ list stays as the record of what was
-        # prepared, like the layer list a pull leaves behind. The narrow
-        # one-line fallback finalizes as a single plain line; an empty
-        # item list just erases (nothing worth keeping).
         try:
-            with _lock:
-                total = len(_items)
-                done = sum(1 for n in _items if _state[n][0] == ST_DONE)
-            cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-            if drew and last_cols is not None and cols < last_cols:
-                # narrowed since the last frame: never climb over possibly
-                # wrapped lines — abandon the old block, draw fresh below
-                out.write("\r\033[J")
-                drew = 0
-            if total == 0:
-                if drew > 1:
-                    out.write("\033[{}A\r\033[J".format(drew - 1))
-                elif drew == 1:
-                    out.write("\r" + EL)
-            elif cols < MIN_FULL_COLS:
-                if drew > 1:
-                    out.write("\033[{}A\r\033[J".format(drew - 1))
-                mark = TICK if done >= total else WAIT_MARK
-                out.write("\r" + EL + "{} prepared {}/{}\n".format(
-                    mark, done, total))
-            else:
-                lines = _frame_lines(tick, t0, cols)
-                prev = drew - 1 if drew > 1 else 0
-                if prev:
-                    out.write("\033[{}A".format(prev))
-                elif drew == 1:
-                    out.write("\r" + EL)
-                for l in lines:
-                    out.write("\r" + EL + l + "\n")
-                if prev > len(lines):
-                    out.write("\033[J")
+            _paint(out, tick, t0, drew, last_cols, final=True)
         finally:
             out.write(RESET + SHOW_CURSOR)
             out.flush()

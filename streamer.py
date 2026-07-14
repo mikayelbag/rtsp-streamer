@@ -1367,13 +1367,17 @@ def main():
         except OSError:
             pass
 
-    tasks = []                   # (display_name, zero-arg prepare callable)
+    # (display_name, loader_group, zero-arg prepare callable) — numbered mini
+    # videos share their folder as loader group, so 65 of them show as one
+    # `mini 12/65` row instead of 65 lines (the manifest keeps the full map)
+    tasks = []
     for src, folder, stem, mount_stem in plain_jobs:
         tasks.append(("{}/{}".format(folder, mount_stem or stem),
+                      folder if mount_stem else None,
                       (lambda s=src, f=folder, t=stem, m=mount_stem:
                        prepare_source(cfg, workspace, s, f, t, mount_stem=m))))
     for folder in sorted(concat_folders):
-        tasks.append(("{}/chain".format(folder),
+        tasks.append(("{}/chain".format(folder), None,
                       (lambda f=folder, it=concat_folders[folder]:
                        prepare_concat(cfg, workspace, f, it))))
 
@@ -1387,10 +1391,10 @@ def main():
     done_lock = threading.Lock()
 
     if anim is not None:
-        loader.set_items([name for name, _ in tasks])
+        loader.set_items([(name, grp) for name, grp, _ in tasks])
 
     def run_job(task):
-        name, fn = task
+        name, _grp, fn = task
         if anim is not None:
             loader.item_start(name)
         try:
@@ -1537,16 +1541,49 @@ def main():
     # short (!) markers on as-is streams (camera_grade=false), one legend
     # line at the bottom — visible where the URL gets copied, no log flood
     warn_text = {"bframes": "B-frames", "gop": "long GOP"}
+
+    # numbered mini mounts collapse in the banner: dozens of URLs that
+    # differ only by index would flood the screen, so the first and last
+    # are printed with a count between them (a (!) middle still gets its
+    # own line so no warning is hidden) — manifest.txt keeps the full map
+    display = []                 # ("url", mount, warns) | ("run", folder)
+    runs = {}                    # folder -> [(mount, warns)] in index order
+    for mount, warns in pub_mounts:
+        m = re.match(r"^/(.+)/\d+$", mount)
+        if m and m.group(1) in mini_index:
+            if m.group(1) not in runs:
+                display.append(("run", m.group(1)))
+            runs.setdefault(m.group(1), []).append((mount, warns))
+        else:
+            display.append(("url", mount, warns))
+
+    any_warn = any(w for _, w in pub_mounts)
+
+    def url_row(mount, warns):
+        mark = ("  (! {})".format(", ".join(warn_text.get(w, w) for w in warns))
+                if warns else "")
+        say("  rtsp://{}:{}{}{}".format(advertise, port, mount, mark))
+
     say("")
     say("──────────── RTSP streams ready ────────────")
     say("  port {}  transport {}".format(port, transport))
-    any_warn = False
-    for mount, warns in pub_mounts:
-        mark = ""
-        if warns:
-            any_warn = True
-            mark = "  (! {})".format(", ".join(warn_text.get(w, w) for w in warns))
-        say("  rtsp://{}:{}{}{}".format(advertise, port, mount, mark))
+    for entry in display:
+        if entry[0] == "url":
+            url_row(entry[1], entry[2])
+            continue
+        entries = runs[entry[1]]
+        if len(entries) <= 3:
+            for mount, warns in entries:
+                url_row(mount, warns)
+            continue
+        mids = entries[1:-1]
+        url_row(*entries[0])
+        say("   ⋮  {} … {}  ({} more)".format(
+            mids[0][0], mids[-1][0], len(mids)))
+        for mount, warns in mids:
+            if warns:
+                url_row(mount, warns)
+        url_row(*entries[-1])
     for mount, own_sig in feeder_mounts:
         say("  rtsp://{}:{}{}  (probe — fire: touch workspace/{} | all: touch workspace/{})".format(
             advertise, port, mount, own_sig, SIGNAL_FILE))

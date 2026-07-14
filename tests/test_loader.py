@@ -94,24 +94,62 @@ class TestRow(unittest.TestCase):
         loader._row("some long name here", "10.5s", 5)
 
 
-class TestNoCollapse(unittest.TestCase):
-    """docker-pull style: every video keeps its own line, however many."""
+class TestBoundedBlock(unittest.TestCase):
+    """Finished units scroll away as one-shot ✔ lines; the animated block
+    stays a handful of lines no matter how many videos there are."""
 
-    def test_every_item_gets_a_line(self):
+    def test_block_bounded_and_done_scrolls(self):
         names = ["f/v{}".format(i) for i in range(30)]
         loader.set_items(names)
         for n in names[:10]:
             loader.item_start(n)
             loader.item_done(n)
         loader.item_start(names[10])
-        lines = loader._frame_lines(0, time.monotonic(), 80)
-        self.assertEqual(len(lines), 1 + len(names))   # header + one each
-        plain = [ANSI.sub("", l) for l in lines]
-        for n in names:
-            self.assertTrue(any(n in l for l in plain), n)
-        self.assertEqual(sum("Ready" in l for l in plain[1:]), 10)
-        self.assertEqual(sum("Preparing" in l for l in plain[1:]), 1)
-        self.assertEqual(sum("Waiting" in l for l in plain[1:]), 19)
+        perm, block = loader._frame(0, time.monotonic(), 80)
+        plain_perm = [ANSI.sub("", l) for l in perm]
+        plain_block = [ANSI.sub("", l) for l in block]
+        self.assertEqual(len(perm), 10)              # one ✔ line per done
+        self.assertTrue(all("Ready" in l for l in plain_perm))
+        # block: header + 1 running + waiting count — never one per video
+        self.assertEqual(len(block), 3)
+        self.assertIn("10/30", plain_block[0])
+        self.assertIn(names[10], plain_block[1])
+        self.assertIn("19 waiting", plain_block[2])
+
+    def test_done_lines_emit_once(self):
+        loader.set_items(["a", "b"])
+        loader.item_start("a")
+        loader.item_done("a")
+        perm1, _ = loader._frame(0, time.monotonic(), 80)
+        perm2, _ = loader._frame(1, time.monotonic(), 80)
+        self.assertEqual(len(perm1), 1)
+        self.assertEqual(perm2, [])                  # already scrolled away
+
+
+class TestGrouping(unittest.TestCase):
+    """Numbered mini mounts share one row and one final first…last line."""
+
+    def test_group_single_row_then_final_range(self):
+        items = [("mini/{}".format(i), "mini") for i in range(1, 66)]
+        items.append(("tfa/cam", None))
+        loader.set_items(items)
+        for i in range(1, 13):
+            loader.item_start("mini/{}".format(i))
+            loader.item_done("mini/{}".format(i))
+        loader.item_start("mini/13")
+        perm, block = loader._frame(0, time.monotonic(), 80)
+        self.assertEqual(perm, [])       # group unfinished: nothing scrolls
+        plain = [ANSI.sub("", l) for l in block]
+        self.assertEqual(len(block), 3)  # header + group row + waiting
+        self.assertIn("mini 12/65 Preparing", plain[1])
+        self.assertIn("1 waiting", plain[2])
+        for i in range(13, 66):
+            loader.item_start("mini/{}".format(i))
+            loader.item_done("mini/{}".format(i))
+        perm, _ = loader._frame(1, time.monotonic(), 80)
+        self.assertEqual(len(perm), 1)   # 65 clips -> ONE scrolled line
+        self.assertIn("mini/1 … mini/65 Ready (65 clips)",
+                      ANSI.sub("", perm[0]))
 
 
 class TestPersistedFinalFrame(unittest.TestCase):
