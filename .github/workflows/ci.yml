@@ -9,6 +9,7 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Python syntax
@@ -23,6 +24,7 @@ jobs:
   build-and-smoke:
     runs-on: ubuntu-latest
     needs: lint
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -35,9 +37,13 @@ jobs:
       - name: Generate test video
         run: |
           mkdir -p video_samples/ids workspace config
+          # Camera-grade encode (no B-frames, 1s GOP). With the camera_grade=false
+          # default the streamer serves sources as-is, and libx264's defaults
+          # (bf=2, gop=250 -> one keyframe in the whole 6s clip) produce a stream
+          # readers cannot decode across the -stream_loop seam.
           ffmpeg -hide_banner -loglevel error -f lavfi -t 6 \
             -i testsrc2=size=640x360:rate=30 \
-            -c:v libx264 -preset veryfast -pix_fmt yuv420p \
+            -c:v libx264 -preset veryfast -pix_fmt yuv420p -bf 0 -g 30 \
             video_samples/ids/smoke.mp4
 
       - name: Run container
@@ -70,8 +76,11 @@ jobs:
       - name: Pull 3 seconds of frames
         run: |
           port=$(cat workspace/.port)
-          ffmpeg -hide_banner -v error -rtsp_transport tcp \
-            -i "rtsp://127.0.0.1:${port}/ids/smoke" -t 3 -f null -
+          # timeout: on a broken stream ffmpeg's -t never accumulates and it
+          # blocks forever — fail fast so the logs step below actually runs.
+          timeout 90 ffmpeg -hide_banner -v error -rtsp_transport tcp \
+            -i "rtsp://127.0.0.1:${port}/ids/smoke" -t 3 -f null - \
+            || { echo "::error::frame pull failed or timed out"; exit 1; }
 
       - name: Container logs on failure
         if: failure()
