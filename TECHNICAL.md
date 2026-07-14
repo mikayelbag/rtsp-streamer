@@ -6,7 +6,7 @@ written so that a junior engineer with no video-streaming background can
 follow along. The user-facing overview (quick start, config reference) lives
 in [`README.md`](README.md); this file is the "why and how" companion.
 
-Version covered: **2.4.0**.
+Version covered: **2.9.0**.
 
 ---
 
@@ -158,7 +158,7 @@ Three layers merge, most specific wins, applied in this order:
 ```
 
 The mergeable keys are `SETTING_KEYS = (copies, shift_frames, fps, size,
-bitrate_kbps, probe, force_reencode, mini, camera_grade)`. A **blank value means "don't
+bitrate_kbps, probe, force_reencode, mini, concat, camera_grade)`. A **blank value means "don't
 override"** — `apply_section()` skips empty strings, so a `[video:x]` section
 can override one key without restating the rest.
 
@@ -256,8 +256,10 @@ force_reencode = true        → transcode ("forced")
 fps / size / bitrate ≠ keep  → transcode (the change requires re-encoding)
 ffprobe can't read it        → transcode ("unreadable")
 codec not h264/hevc          → transcode (not RTSP-friendly as-is)
-source has B-frames          → transcode ("bframes" — camera realism, below)
-keyframes > 2×KEYINT apart   → transcode ("gop" — camera realism, below)
+source has B-frames          → transcode ("bframes") with camera_grade=true,
+                               else remux + (!) warning (camera realism, below)
+keyframes > 2×KEYINT apart   → transcode ("gop") with camera_grade=true,
+                               else remux + (!) warning (camera realism, below)
 otherwise                    → remux (-c copy, lossless, fast)
 ```
 
@@ -285,22 +287,23 @@ repeat-headers=1            SPS/PPS before every IDR → a mid-stream join
                             can configure its decoder immediately
 ```
 
-and `needs_transcode()` refuses to remux any source that itself carries
-B-frames (`has_b_frames` from ffprobe) or a keyframe cadence looser than
-2×KEYINT (`_gop_too_long()`, read from the packet index). The observable
-result matches a real camera exactly: joining mid-stream costs at most one
-keyframe interval (≤2 s) of waiting, then a clean picture — no decode-error
-spam.
+and with `camera_grade = true`, `needs_transcode()` refuses to remux any
+source that itself carries B-frames (`has_b_frames` from ffprobe) or a
+keyframe cadence looser than 2×KEYINT (`_gop_too_long()`, read from the
+packet index). The observable result matches a real camera exactly: joining
+mid-stream costs at most one keyframe interval (≤2 s) of waiting, then a
+clean picture — no decode-error spam.
 
-**Opting out: `camera_grade = false`.** The realism checks (B-frames, long
-GOP) demote from re-encode reasons to *warnings*: the source is remuxed
-as-is (no CPU burn on first run), the warning is recorded in the artifact's
-build stamp, and the URL banner marks the stream with a short `(!)` suffix
-plus one legend line — visible exactly where the URL gets copied, no log
-noise. Switching back to `true` rebuilds the marked artifacts automatically
-(the stamp remembers). Codec conversion is *not* affected: a non-h264/hevc
-source (e.g. MPEG-4 Part 2) always re-encodes — that's compatibility, not
-realism; no engine speaks Xvid over RTSP.
+**The default: `camera_grade = false` (since 2.5.0).** The realism checks
+(B-frames, long GOP) are *warnings*, not re-encode reasons: the source is
+remuxed as-is (no CPU burn on first run), the warning is recorded in the
+artifact's build stamp, and the URL banner marks the stream with a short
+`(!)` suffix plus one legend line — visible exactly where the URL gets
+copied, no log noise. Setting `camera_grade = true` rebuilds the marked
+artifacts automatically (the stamp remembers). Codec conversion is *not*
+affected by the setting: a non-h264/hevc source (e.g. MPEG-4 Part 2) always
+re-encodes — that's compatibility, not realism; no engine speaks Xvid over
+RTSP.
 
 Transcodes are libx264 `-preset veryfast` with the params above, yuv420p,
 audio stripped (`-an` — analytics engines don't consume audio, and dropping
@@ -430,6 +433,30 @@ the timeline, so phase offset is meaningless — the code zeroes `shift`), and
 combined with `probe = true` the black tail is dropped from the file because
 the probe feeder itself returns to black after playing content (§10) — that
 *is* the trailing black.
+
+**Numbered mounts.** Mini streams mount as plain numbers in scan order —
+`/mini/1`, `/mini/2`, … — instead of file stems (side-clip filenames are
+usually long and irrelevant to the engine under test). The number → source
+file map is written to `workspace/<folder>/manifest.txt`
+(`MANIFEST_NAME`), and the URL banner prints only the first and last mini
+URL with a `⋮ (N more)` line between, so 60 clips don't flood the banner.
+
+### 9.1 Concat chains (`concat = true`)
+
+`prepare_concat()` chains **all** of a folder's videos into ONE looping
+stream mounted at `/<folder>/chain`. Per video, `build_concat_segment()`
+produces one normalised segment:
+
+```
+[ first frame frozen CONCAT_FREEZE_S (3 s) ][ the clip ][ last frame frozen 3 s ][ CONCAT_GAP_S (2 s) black ]
+```
+
+with the video's index burned into the top-left corner (drawtext — the
+reason the image ships `font-dejavu`). Mixed sources are normalised to the
+folder's `size`/`fps` (`CONCAT_DEFAULT_SIZE` 1920×1080 @ 30 when `keep`),
+then the segments are concatenated into a single uniform artifact. The
+`manifest.txt` records index → source file, start offset inside the loop
+and duration — know the number on screen, find the video and when it plays.
 
 ---
 
@@ -634,66 +661,75 @@ Cosmetic, prod-mode only, and animated whenever stdout is a **TTY**
 (`isatty()`). In the image that is *always*: the entrypoint runs streamer.py
 under its own pseudo-terminal (`ptyrun.py` — a ~60-line pty wrapper that
 copies output verbatim, forwards SIGTERM for graceful `docker stop`, sets a
-sane 120×30 winsize, and execs directly when a real terminal is already
+fixed 24×80 winsize, and execs directly when a real terminal is already
 attached). So the block animates in place under `docker compose up` with no
-`tty:` line in anyone's compose file. The display emulates
-**`docker compose pull`**: a header with a braille bar and overall counts,
-then one line per video with its own state mark and a right-aligned elapsed
-time:
+`tty:` line in anyone's compose file. The display is structured exactly like
+**`docker compose pull`**: a summary header that is always the block's first
+line, then **one fixed row per folder** that changes state in place —
+`- Waiting` → `⠸ k/n Preparing` → `✔ Ready` — just as pull's layer rows go
+Waiting → Downloading → Pull complete:
 
 ```
-rtsp_streamer  | [prepare] processing 5 videos... (details: workspace/streamer.log)
+rtsp_streamer  | [prepare] processing 70 videos... (details: workspace/streamer.log)
 rtsp_streamer  |
-                 ⠸ rtsp-streamer v2.4.0 [⣿⣿⣿⣿⣧⠀⠀⠀⠀⠀⠀⠀] 2/5 Preparing      11.5s
-                   ✔ ids/first Ready                                       3.5s
-                   ✔ ids/seconds Ready                                     7.1s
-                   ⠸ ids/third Preparing                                   9.4s
-                   - tfa/dalma_fhd Waiting
+rtsp_streamer  | ⠸ rtsp-streamer v2.9.0 [⣿⣶⡀] 23/70 Preparing      51.4s
+rtsp_streamer  |   ✔ ids Ready (3 videos)                          49.3s
+rtsp_streamer  |   ⠸ tfa 2/5 Preparing dalma_fhd                    9.4s
+rtsp_streamer  |   ⠸ mini 16/61 Preparing                          31.0s
 ```
 
-Under compose the service-name prefix only lands on ordinary
-newline-flushed lines; the loader's in-place redraws bypass it — so the
-block is indented `INDENT` (17) columns, parking it just right of the
-`rtsp_streamer  | ` prefix column where it reads as part of the log flow.
-A blank spacer line separates it from the prefixed lines above. The block
-erases itself on stop(), leaving the prefixed banner and URL listing as the
-only scrollback. **Without any TTY** (running streamer.py directly with
-piped output, CI) the animation never starts and prod prints the same
-braille bar as append-only snapshot lines (`loader.snapshot()`, no ANSI
-codes), one per prepared video.
+Nothing is ever printed above the header, so it cannot sink as folders
+finish; the block is 1 + #folders lines tall, so it fits the pty's 24 rows
+even with hundreds of videos (folders stay few). `stop()` paints one final
+all-✔ frame that stays put in the scrollback — the record of the run,
+docker-pull style — followed by the URL listing. **Without any TTY**
+(running streamer.py directly with piped output, CI) the animation never
+starts and prod prints a plain braille bar as append-only snapshot lines
+(`loader.snapshot()`, no ANSI codes), one per prepared video.
 
 Design notes that matter to a reader:
 
 - Runs on a daemon thread; `set_items()` / `item_start()` / `item_done()`
   are the API (all lock-protected) — streamer declares the ordered video
-  list once, then each prepare worker marks its item running/done.
-  `start()` returns a handle; `stop(handle)` joins the thread.
-- Per-item lines follow the compose-pull rhythm: `-` waiting (dim),
-  spinner + ticking elapsed while preparing, green `✔` + frozen elapsed
-  when ready. Elapsed is right-aligned at the terminal edge; long names
-  truncate with `…` so the column never breaks.
-- The header bar is bracketed docker-pull style: fill `⣿`, empty track the
-  blank braille cell `⠀` (U+2800 — same width as `⣿`, so geometry never
-  shifts). It fills at **dot resolution** (`⡀⡄⡆⡇⣇⣧⣷⣿`, 8 steps per cell)
-  and *moves* instead of jumping: each frame it crawls toward the real
-  done/total position (`CATCHUP_FRAC` of the gap per frame), and while a
-  slow build holds progress still it creeps forward through the
-  in-progress video's span — capped at `CREEP_CAP` (90%) of it, so the bar
-  never claims a video that isn't done. Monotonic.
-- Long item lists collapse (finished fold into `✔ N ready`, pending into
-  `… N waiting`) so the block height stays bounded — the baked pty is only
-  24 rows.
-- Each redraw rewrites the block in place (`\r` + erase-to-EOL per line,
-  cursor-up between frames). Terminal width is re-read every frame; if the
-  terminal *narrows* mid-run the old block may have wrapped (cursor-up
-  counts would lie), so it is abandoned in place and a fresh block starts
-  below — resize-safe. The baked pty is fixed at 80 columns, the floor
-  virtually every real terminal meets, so frames never wrap on the
-  viewer's side. Terminals narrower than the block fall back to a one-line
-  spinner.
-- The cursor is hidden while running and always restored in a `finally`;
-  `stop()` erases the block so the final scrollback is just the banner and
-  the stream-URL listing.
+  list once, then each prepare worker marks its item running/done. Videos
+  sharing a folder share one row; a *group* key (the numbered mini mounts)
+  makes the row count clips without naming the current one, and its final
+  line reads `✔ mini Ready (61 clips)` — the per-index map lives in
+  `workspace/<folder>/manifest.txt`. `start()` returns a handle;
+  `stop(handle)` joins the thread.
+- **Compose-prefix safety.** Compose prefixes every `\n`-terminated chunk
+  with `rtsp_streamer  | `; a redraw that starts with `\r` + erase-to-EOL
+  wipes that prefix and leaves a bare gutter (the pre-2.9 bug). So every
+  block line ends in a real newline (compose prefixes it) and redraws
+  never touch the prefix columns: the cursor jumps straight to column
+  `INDENT`+1 (`\033[18G`) and erases only rightward. Compose's genuine
+  prefix survives every frame; nothing fake is painted. On a bare terminal
+  the same columns are simply an empty margin.
+- **The header bar is docker pull's**, not a left-to-right meter: one
+  braille cell per folder, and each folder's own cell **rises bottom-up**
+  (`⠀⡀⣀⣄⣤⣦⣶⣷⣿`, 8 dot-steps) with that folder's done/total —
+  `[⣿⣶⡀]` reads folder 1 done, folder 2 ~70 %, folder 3 just started.
+  A cell crawls toward its real position (`CATCHUP_FRAC` of the gap per
+  frame) and while a slow video holds progress it creeps upward, capped at
+  `CREEP_CAP` (90 %) of the in-progress video's share — a cell never
+  claims work that isn't done. Monotonic per folder. (The empty track is
+  the blank braille cell `⠀`, U+2800 — same width as `⣿`, so geometry
+  never shifts.)
+- Rows follow the compose-pull rhythm: dim `-` Waiting, spinner + ticking
+  elapsed while preparing (ungrouped rows also name the video currently
+  being worked on), green `✔` + frozen elapsed when ready. Elapsed is
+  right-aligned at the terminal edge; long names truncate with `…` so the
+  column never breaks. Should folders ever outnumber the screen, trailing
+  Waiting rows collapse into one `- N folders Waiting` row.
+- Each redraw rewrites the block in place (cursor-up between frames,
+  column-addressed erase per line). Terminal width is re-read every frame;
+  if the terminal *narrows* mid-run the old block may have wrapped
+  (cursor-up counts would lie), so it is abandoned in place and a fresh
+  block starts below — resize-safe. The baked pty is fixed at 80 columns,
+  the floor virtually every real terminal meets, so frames never wrap on
+  the viewer's side. Terminals narrower than the block fall back to a
+  one-line spinner.
+- The cursor is hidden while running and always restored in a `finally`.
 
 ---
 

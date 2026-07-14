@@ -18,7 +18,7 @@
 #    ./dockerhub.sh list-tags
 #    ./dockerhub.sh push-readme
 #    ./dockerhub.sh prune-tags                 # keeps only latest
-#    ./dockerhub.sh prune-tags latest 2.4.0    # keep an explicit set
+#    ./dockerhub.sh prune-tags latest 2.9.0    # keep an explicit set
 #    ./dockerhub.sh prune-tags --all           # delete EVERY tag (repush after!)
 # ════════════════════════════════════════════════════════════════════
 set -euo pipefail

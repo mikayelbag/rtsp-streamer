@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Loader — docker-pull-style progress display for prod mode.
 
-    rtsp_streamer  | ⠸ rtsp-streamer v2.5.0 [⣿⣶⡀⠀] 23/70 Preparing  51.4s
+    rtsp_streamer  | ⠸ rtsp-streamer v2.9.0 [⣿⣶⡀⠀] 23/70 Preparing  51.4s
     rtsp_streamer  |   ✔ ids Ready (3 videos)                        49.3s
     rtsp_streamer  |   ⠸ tfa 2/5 Preparing dalma_fhd                  9.4s
     rtsp_streamer  |   ⠸ mini 16/61 Preparing                        31.0s
     rtsp_streamer  |   - concat Waiting
 
 Usage:
-    handle = loader.start(subtitle="v2.5.0")
+    handle = loader.start(subtitle="v2.9.0")
     loader.set_items([("ids/first", None), ("mini/1", "mini"), ...])
     loader.item_start("mini/1")                           # worker began it
     loader.item_done("mini/1")                            # worker finished it

@@ -91,9 +91,10 @@ overrides. Key settings:
 | `shift_frames` | `0` | phase offset between copies — simulate out-of-phase cameras |
 | `fps` / `size` / `bitrate_kbps` | `keep` | re-encode targets (`keep` = stream as-is) |
 | `force_reencode` | `false` | always normalise to H.264, 2 s keyframes |
-| `camera_grade` | `true` | re-encode sources with B-frames / long GOP so streams behave like real IP cameras; `false` = serve them as-is (faster first run, URL gets a `(!)` marker, mid-stream joins may glitch) |
+| `camera_grade` | `false` | `true` = re-encode sources with B-frames / long GOP so streams behave exactly like real IP cameras; `false` (default) = serve them as-is — faster first run, the URL gets a `(!)` marker, mid-stream joins may glitch |
 | `probe` | `false` | black until a signal, then play once (see below) |
-| `mini` | `false` | short-clip 1-minute loop: frozen first frame 10 s + clip + black (see below) |
+| `mini` | `false` | short-clip 1-minute loop: frozen first frame 10 s + clip + black; streams mount as numbers `/mini/1…N` (see below) |
+| `concat` | `false` | chain a folder's videos into ONE looping stream `/<folder>/chain` (see below) |
 
 ### Volumes
 
@@ -112,7 +113,7 @@ overrides. Key settings:
 
 | Var | Default | Meaning |
 |---|---|---|
-| `MODE` | `prod` | `prod` = progress bar + URL list (details → `workspace/streamer.log`) · `dev` = full logs on stdout. Progress animates in place, `docker compose pull` style — a header bar plus one ✔/spinner line per video with elapsed times. The image runs the streamer on its own pseudo-terminal, so it works under compose with no `tty:` line needed. |
+| `MODE` | `prod` | `prod` = progress display + URL list (details → `workspace/streamer.log`) · `dev` = full logs on stdout. Progress animates in place, `docker compose pull` style: a pinned summary header whose bar has one braille cell per folder rising with that folder's own progress, then one `- Waiting` → `⠸ Preparing` → `✔ Ready` row per folder with elapsed times. The image runs the streamer on its own pseudo-terminal, so it works under compose with no `tty:` line needed, and compose's `rtsp_streamer \|` log prefix stays intact on every line. |
 | `ADVERTISE_IP` | auto | overrides `advertise_ip` from config |
 
 ### Ports
@@ -158,8 +159,10 @@ Set `mini = true` for short side-clips (a few seconds long). Each becomes a
 ```
 
 The composite is built once (one uniform H.264 encode) and cached, then looped
-seamlessly like any other stream. The shipped config enables it for a `mini/`
-folder:
+seamlessly like any other stream. Mini streams mount as **numbers** in scan
+order — `rtsp://…/mini/1`, `/mini/2`, … — and `workspace/mini/manifest.txt`
+maps each number back to its file. The shipped config enables it for a
+`mini/` folder:
 
 ```ini
 [folder:mini]
@@ -177,6 +180,28 @@ optional — if it doesn't exist there simply are no mini streams, no error.
   black tail is dropped and the loop simply runs a little past 60 s.
 - **Ignores `shift_frames`** — mini reshapes the whole clip, so phase offset
   doesn't apply.
+
+---
+
+## Concat chains — many videos, one stream
+
+Set `concat = true` for a folder and ALL of its videos chain into **one
+looping stream** at `rtsp://…/<folder>/chain`. Per video:
+
+```
+[ first frame frozen 3s ] → [ the clip ] → [ last frame frozen 3s ] → [ 2s black ] → next video
+```
+
+Each video's index is burned into its top-left corner (drawtext), and
+`workspace/<folder>/manifest.txt` maps index → file + where it starts inside
+the loop. Mixed sources are normalised to `size`/`fps` (1920×1080 @ 30 when
+`keep`). The shipped config enables it for a `concat/` folder — optional,
+absent folder = no chain, no error:
+
+```ini
+[folder:concat]
+concat = true
+```
 
 ---
 
@@ -220,13 +245,16 @@ already make a restarted recorder resume its playlist correctly.
   re-encode otherwise). TS is what makes `-stream_loop -1` loop without
   the MP4 non-monotonic-DTS crash that disconnects every client at the wrap.
   Prepared files are cached and rebuilt only when the source is newer.
-- **Camera-grade H.264** — streams mimic real IP cameras: **no B-frames**, a
-  fixed 2 s IDR cadence, SPS/PPS repeated before every keyframe. Sources that
-  don't already look like that (B-frames, long/irregular GOP) are re-encoded
-  instead of remuxed, and stale cached files from older versions are detected
-  and rebuilt. A client joining mid-stream waits at most one keyframe
-  interval (≤2 s) for a clean picture — exactly like a real camera — instead
-  of spraying `reference picture missing during reorder` decode errors.
+- **Camera-grade H.264 (opt-in)** — with `camera_grade = true` streams mimic
+  real IP cameras: **no B-frames**, a fixed 2 s IDR cadence, SPS/PPS repeated
+  before every keyframe; sources that don't already look like that are
+  re-encoded instead of remuxed, and a client joining mid-stream waits at
+  most one keyframe interval (≤2 s) for a clean picture instead of spraying
+  `reference picture missing during reorder` decode errors. By default
+  (`camera_grade = false`) such sources are served **as-is** — no re-encode
+  on first run — and their URLs carry a `(!)` marker warning that mid-stream
+  joins may glitch. Flipping the setting rebuilds the affected cache entries
+  automatically.
 - **Crash-safe cache** — prepared files are written to a temp name and renamed
   into place atomically, so a container killed mid-transcode never leaves a
   truncated file that would be served on the next run.
@@ -263,7 +291,8 @@ Deep-dive documentation of every internal mechanism lives in
 
 | Tag | What |
 |---|---|
-| `latest` | the current release — versioned tags will appear once the tool reaches its first stable version |
+| `latest` | the current release |
+| `X.Y.Z` (e.g. `2.9.0`) | pinned release versions |
 
 ## Security note
 

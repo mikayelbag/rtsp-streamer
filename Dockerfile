@@ -47,7 +47,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 # OCI metadata — shows up on Docker Hub / `docker inspect`.
 LABEL org.opencontainers.image.title="RTSP Streamer" \
       org.opencontainers.image.description="Serve every video in a folder as a looping live RTSP stream — for benchmarking video-analytics engines. MediaMTX + ffmpeg, probe mode, mini-clip mode, concat chains, phase-shifted camera simulation." \
-      org.opencontainers.image.version="2.5.0" \
+      org.opencontainers.image.version="2.9.0" \
       org.opencontainers.image.licenses="MIT"
 
 ENTRYPOINT ["/app/entrypoint.sh"]
