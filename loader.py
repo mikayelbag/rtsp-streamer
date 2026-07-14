@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Loader — docker-pull-style progress display for prod mode.
 
-    rtsp_streamer  | ⠸ rtsp-streamer v2.5.0 [⣿⣿⣷⠀⠀⠀⠀] 23/70 Preparing  51.4s
-    rtsp_streamer  |   ✔ ids Ready (3 videos)                           49.3s
-    rtsp_streamer  |   ⠸ tfa 2/5 Preparing dalma_fhd                     9.4s
-    rtsp_streamer  |   ⠸ mini 16/61 Preparing                           31.0s
+    rtsp_streamer  | ⠸ rtsp-streamer v2.5.0 [⣿⣶⡀⠀] 23/70 Preparing  51.4s
+    rtsp_streamer  |   ✔ ids Ready (3 videos)                        49.3s
+    rtsp_streamer  |   ⠸ tfa 2/5 Preparing dalma_fhd                  9.4s
+    rtsp_streamer  |   ⠸ mini 16/61 Preparing                        31.0s
     rtsp_streamer  |   - concat Waiting
 
 Usage:
@@ -26,42 +26,43 @@ Design notes:
     redraw can never clamp at the screen top and smear. Should folders
     still outnumber the screen, trailing Waiting rows collapse into one
     `- N folders Waiting` row.
+  - The header bar is docker pull's, not a left-to-right meter: one
+    braille cell per folder (2 dot-columns), and each folder's own cell
+    RISES bottom-up (⠀⡀⣀⣄⣤⣦⣶⣷⣿) with that folder's done/total —
+    `[⣿⣶⡀⠀]` reads folder 1 done, folder 2 ~70%, folder 3 started,
+    folder 4 waiting. While a folder holds on a slow video its cell
+    creeps up a little, capped below the next video's share, so a cell
+    never claims work that isn't done. Monotonic per folder.
+  - Compose-prefix safety: under `docker compose up` every
+    `\\n`-terminated chunk gets the `rtsp_streamer  | ` prefix from
+    compose itself. Each block line therefore ends in a real newline
+    (so compose prefixes it), and redraws never touch the prefix
+    columns: instead of `\\r`, the cursor jumps to column INDENT+1 and
+    erases only rightward. Compose's genuine prefix survives every
+    frame; nothing fake is painted. On a bare terminal the same
+    columns are simply left as a margin.
   - Grouping: set_items entries may carry a group key (the numbered mini
     mounts). A grouped folder row counts clips but never names the
     current one (`⠸ mini 16/61 Preparing`), and finishes as
     `✔ mini Ready (61 clips)` — the per-index map stays in
     workspace/<folder>/manifest.txt. Ungrouped folder rows name the video
     being worked on (`⠸ tfa 2/5 Preparing dalma_fhd`).
-  - Every line the loader draws starts with the compose log prefix
-    (`rtsp_streamer  | `). Under `docker compose up` the redraws (\\r +
-    erase-to-EOL) wipe the prefix compose itself printed for the chunk,
-    which used to leave a bare gutter; painting the prefix ourselves
-    fills it, and on a bare terminal it reads as a consistent label. The
-    name comes from LOG_PREFIX (default rtsp_streamer, matching the
-    shipped docker-compose.yaml container_name; set LOG_PREFIX= empty to
-    disable the gutter entirely).
-  - The bar fills at *dot* resolution (8 braille dots per cell) and
-    *moves* docker-pull style: each frame the displayed fill crawls
-    toward the real done/total position, and while a slow build holds
-    progress still it creeps forward — capped below the next video's
-    boundary, so the bar never claims a video that isn't done. Monotonic.
   - The animation needs a TTY on stdout. In the image that is always
     true: the entrypoint runs streamer.py under its own pseudo-terminal
     (ptyrun.py, fixed at 80 columns — the floor virtually every real
     terminal meets, so frames never wrap on the viewer's side). Without
     any TTY (direct run with piped output, CI) streamer.py skips the
     animation and prints append-only snapshot lines via snapshot().
-  - Redraw is in place (\\r + erase-to-EOL per line, cursor-up between
-    frames). stop() paints one final all-✔ frame that stays put in the
-    scrollback — the record of the run, docker-pull style. If the
-    terminal *narrows* mid-run the old block may have wrapped (cursor-up
-    counts would lie), so it is abandoned in place and a fresh block
-    starts below — resize-safe. Terminals narrower than the block fall
-    back to a one-line spinner.
+  - Redraw is in place (cursor-up between frames, column-addressed
+    erase per line). stop() paints one final all-✔ frame that stays put
+    in the scrollback — the record of the run, docker-pull style. If
+    the terminal *narrows* mid-run the old block may have wrapped
+    (cursor-up counts would lie), so it is abandoned in place and a
+    fresh block starts below — resize-safe. Terminals narrower than the
+    block fall back to a one-line spinner.
   - The cursor is hidden while running and always restored (finally:).
 """
 
-import os
 import shutil
 import sys
 import threading
@@ -79,16 +80,17 @@ EL = "\033[K"                 # erase to end of line
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 TICK = "✔"                    # docker compose's completion mark
 WAIT_MARK = "-"
-# one braille cell filling dot by dot: left column bottom-up, then right
+# one braille cell rising bottom-up, 0..8 dots — docker pull's layer cell
+RISE = "⠀⡀⣀⣄⣤⣦⣶⣷⣿"
+# left-to-right fill (kept for the non-TTY snapshot line only)
 CELL = "⡀⡄⡆⡇⣇⣧⣷⣿"          # 1..8 dots
 FULL, TRACK = "⣿", "⠀"   # track = blank braille cell, same width as ⣿
-BAR_W = 12                    # header bar cells -> 96 dot-steps
+BAR_W = 12                    # snapshot() bar cells
 FPS = 12
-
-# compose-style log gutter painted on every loader line (see docstring)
-_name = os.environ.get("LOG_PREFIX", "rtsp_streamer")
-PFX = "{}  | ".format(_name) if _name else ""
-INDENT = len(PFX)
+INDENT = 17                   # compose prints `rtsp_streamer  | ` (17 cols);
+                              # the loader never writes left of this column,
+                              # so that real prefix survives every redraw
+GO_COL = "\033[{}G".format(INDENT + 1)   # jump straight past the prefix
 MIN_FULL_COLS = INDENT + 44   # narrower than this -> one-line fallback
 # animation rates, in dots (eighth-cells) per frame:
 CATCHUP_FRAC = 0.25           # fraction of the gap to real progress closed per frame
@@ -112,6 +114,7 @@ def set_items(entries):
     with _lock:
         _units[:] = []
         _state.clear()
+        _frame.fills = {}
         by_folder = {}
         for e in entries:
             name, group = (e, None) if isinstance(e, str) else (e[0], e[1])
@@ -151,7 +154,8 @@ def _elapsed(dt):
 
 
 def _bar_at(eighths):
-    """Braille bar filled to `eighths` dots (of BAR_W * 8 total)."""
+    """Left-to-right braille bar for snapshot(): filled to `eighths` dots
+    (of BAR_W * 8 total)."""
     e = max(0, min(BAR_W * 8, int(eighths)))
     full, rem = divmod(e, 8)
     out = FULL * full
@@ -161,36 +165,38 @@ def _bar_at(eighths):
 
 
 def _advance(shown, done, total):
-    """One animation step for the displayed fill (in dots).
+    """One animation step for a displayed fill (in dots of an 8-dot span
+    per video).
 
     Crawl quickly toward the real done/total position; once there, creep
     slowly forward through the in-progress video's span (capped at
-    CREEP_CAP of it, so the bar never claims a video that isn't done).
+    CREEP_CAP of it, so the fill never claims a video that isn't done).
     Monotonic: the fill only ever moves forward."""
     if total <= 0:
         return shown
-    span = BAR_W * 8 / total                 # dots per video
-    target = min(BAR_W * 8, span * done)
+    span = 8.0 / total                       # dots per video (8-dot cell)
+    target = min(8.0, span * done)
     if shown < target:
-        return min(target, shown + max(1.0, (target - shown) * CATCHUP_FRAC))
+        return min(target, shown + max(0.5, (target - shown) * CATCHUP_FRAC))
     if done < total:
         return min(target + span * CREEP_CAP, shown + CREEP)
     return shown
 
 
 def snapshot(done, total):
-    """The same bar as one plain append-only line — for non-TTY output
-    (piped logs, CI) where in-place redraws would scramble.
+    """The overall progress as one plain append-only line — for non-TTY
+    output (piped logs, CI) where in-place redraws would scramble.
     No ANSI codes: safe in log files and captures."""
     fill, track = _bar_at(0 if total <= 0 else BAR_W * 8 * done // total)
     return "[{}{}] {}/{}".format(fill, track, done, total)
 
 
 def _row(left, elapsed, w, mark=None, mcolor=None, dim=False):
-    """One display line: the log gutter, then `left` truncated to fit,
-    `elapsed` right-aligned at the terminal edge (docker-compose style).
-    Colors are injected after the plain text is measured, so padding
-    stays exact; the gutter is never colored."""
+    """One display line: `left` truncated to fit, `elapsed` right-aligned
+    at the terminal edge (docker-compose style). The INDENT prefix columns
+    are never part of the text — the painter positions the cursor past
+    them. Colors are injected after the plain text is measured, so
+    padding stays exact."""
     w -= INDENT
     room = w - (len(elapsed) + 2) if elapsed else w
     if len(left) > room:
@@ -204,7 +210,7 @@ def _row(left, elapsed, w, mark=None, mcolor=None, dim=False):
     elif dim:
         left = DIM + left + RESET
     tail = "{}  {}{}{}".format(pad, DIM, elapsed, RESET) if elapsed else pad
-    return PFX + left + tail
+    return left + tail
 
 
 def _unit_view(u, state):
@@ -248,6 +254,22 @@ def _folder_row(u, view, spin, now, w):
                 "", w, dim=True)
 
 
+def _cells(units, views):
+    """The header bar: one braille cell per folder, rising bottom-up with
+    that folder's own progress — docker pull's per-layer cells."""
+    out = []
+    for u, v in zip(units, views):
+        st, done, total = v[0], v[1], v[2]
+        if st == ST_DONE:
+            fill = 8.0
+        else:
+            shown = _frame.fills.get(u["label"], 0.0)
+            fill = _advance(shown, done, total) if st == ST_RUN else 0.0
+        _frame.fills[u["label"]] = fill
+        out.append(RISE[int(fill)])
+    return "".join(out)
+
+
 def _frame(tick, t0, cols, rows=24):
     """One frame -> the block's lines, drawn in place every time:
     summary header first (always the top line), then one fixed row per
@@ -265,11 +287,10 @@ def _frame(tick, t0, cols, rows=24):
     done = sum(v[1] for v in views)
     total = sum(v[2] for v in views)
 
-    # header: spinner, name, bar, counts, verb, total elapsed on the right
+    # header: spinner, name, per-folder cells, counts, verb, total elapsed
     finished = total > 0 and done >= total
-    fill, track = _bar_at(BAR_W * 8 if finished else _frame.shown)
-    head = "{} rtsp-streamer {} [{}{}] {}/{} {}".format(
-        TICK if finished else spin, subtitle, fill, track,
+    head = "{} rtsp-streamer {} [{}] {}/{} {}".format(
+        TICK if finished else spin, subtitle, _cells(units, views),
         done, total, "Ready" if finished else "Preparing")
     block = [_row(head, _elapsed(now - t0), w,
                   mark=TICK if finished else spin,
@@ -299,17 +320,20 @@ def _frame(tick, t0, cols, rows=24):
     return block
 
 
-_frame.shown = 0.0            # displayed bar fill in dots (animated)
+_frame.fills = {}             # folder label -> displayed cell fill in dots
 
 
 def _paint(out, tick, t0, drew, last_cols, final=False):
     """Draw one frame in place; returns the new (drew, last_cols).
     `drew` > 1 means a block of drew-1 lines is on screen; 1 means the
-    narrow one-line spinner; 0 means nothing to climb over."""
+    narrow one-line spinner; 0 means nothing to climb over.
+
+    Every full-block line is written as `GO_COL + erase + text + \\n`:
+    the newline makes compose prefix the line, and the column jump keeps
+    every redraw to the right of that prefix (see docstring)."""
     with _lock:
         total = len(_state)
         done = sum(1 for n in _state if _state[n][0] == ST_DONE)
-    _frame.shown = _advance(_frame.shown, done, total)
     size = shutil.get_terminal_size(fallback=(80, 24))
     cols = size.columns
     buf = []
@@ -318,34 +342,34 @@ def _paint(out, tick, t0, drew, last_cols, final=False):
         # cursor-up counts no longer match physical lines — never climb
         # over them. Abandon the old block (it stays as one stale frame)
         # and draw a fresh one below.
-        buf.append("\r\033[J")
+        buf.append(GO_COL + "\033[J")
         drew = 0
     last_cols = cols
 
     if total == 0:
         if final:                 # nothing worth keeping: just erase
             if drew > 1:
-                buf.append("\033[{}A\r\033[J".format(drew - 1))
+                buf.append("\033[{}A".format(drew - 1) + GO_COL + "\033[J")
             elif drew == 1:
-                buf.append("\r" + EL)
+                buf.append(GO_COL + EL)
             drew = 0
         else:
-            text = "\r{}{}{}{} preparing".format(
-                PFX, CYAN, SPINNER[tick % len(SPINNER)], RESET)
-            buf.append(text[:cols + len(CYAN + RESET)] + EL)
+            text = "{}{}{} preparing".format(
+                CYAN, SPINNER[tick % len(SPINNER)], RESET)
+            buf.append(GO_COL + EL + text)
             drew = 1
     elif cols < MIN_FULL_COLS:    # one-line fallback
         if drew > 1:              # leaving block mode: erase block
-            buf.append("\033[{}A\r\033[J".format(drew - 1))
+            buf.append("\033[{}A".format(drew - 1) + GO_COL + "\033[J")
         if final:
             mark = TICK if done >= total else WAIT_MARK
-            buf.append("\r" + EL + "{}{} prepared {}/{}\n".format(
-                PFX, mark, done, total))
+            buf.append(GO_COL + EL + "{} prepared {}/{}\n".format(
+                mark, done, total))
             drew = 0
         else:
-            line = "\r{}{}{}{} preparing {}/{}".format(
-                PFX, CYAN, SPINNER[tick % len(SPINNER)], RESET, done, total)
-            buf.append(line[:cols + len(CYAN + RESET)] + EL)
+            text = "{}{}{} preparing {}/{}".format(
+                CYAN, SPINNER[tick % len(SPINNER)], RESET, done, total)
+            buf.append(GO_COL + EL + text)
             drew = 1
     else:
         block = _frame(tick, t0, cols, size.lines)
@@ -353,9 +377,9 @@ def _paint(out, tick, t0, drew, last_cols, final=False):
         if prev:                  # climb back to the block's top
             buf.append("\033[{}A".format(prev))
         elif drew == 1:           # leaving one-line mode
-            buf.append("\r" + EL)
+            buf.append(GO_COL + EL + "\n")
         for l in block:
-            buf.append("\r" + EL + l + "\n")
+            buf.append(GO_COL + EL + l + "\n")
         if prev > len(block):     # block shrank: erase the leftovers
             buf.append("\033[J")
         # the final frame stays put in the scrollback (docker-pull style):
@@ -372,7 +396,7 @@ def _run(ev):
     tick = 0
     drew = 0                              # see _paint
     last_cols = None
-    _frame.shown = 0.0
+    _frame.fills = {}
     # a blank spacer line first, so the animated block sits visually apart
     # from surrounding (compose-prefixed) log lines instead of touching them
     out.write("\n" + HIDE_CURSOR)

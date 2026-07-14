@@ -47,6 +47,8 @@ class TestBarAt(unittest.TestCase):
 
 
 class TestAdvance(unittest.TestCase):
+    """_advance animates one folder's 8-dot cell."""
+
     def test_monotonic_toward_target(self):
         shown = 0.0
         for _ in range(200):
@@ -55,7 +57,7 @@ class TestAdvance(unittest.TestCase):
             shown = nxt
         # settles at (or creeps just past) the real position, but never
         # claims the in-progress video
-        span = loader.BAR_W * 8 / 4
+        span = 8.0 / 4
         self.assertGreaterEqual(shown, span * 2)
         self.assertLess(shown, span * 3)
 
@@ -63,7 +65,7 @@ class TestAdvance(unittest.TestCase):
         shown = 0.0
         for _ in range(500):
             shown = loader._advance(shown, done=4, total=4)
-        self.assertEqual(shown, loader.BAR_W * 8)
+        self.assertEqual(shown, 8.0)
 
     def test_zero_total_no_move(self):
         self.assertEqual(loader._advance(5.0, done=0, total=0), 5.0)
@@ -83,7 +85,8 @@ class TestRow(unittest.TestCase):
     def test_right_aligned_elapsed(self):
         row = loader._row("name", "3.5s", 40)
         visible = re.sub(r"\033\[[0-9;]*m", "", row)
-        self.assertEqual(len(visible), 40)     # elapsed lands at the edge
+        # text starts past the INDENT prefix columns, ends at the edge
+        self.assertEqual(len(visible), 40 - loader.INDENT)
         self.assertTrue(row.endswith("3.5s" + loader.RESET))
 
     def test_long_left_truncated(self):
@@ -106,7 +109,8 @@ class TestDockerPullBlock(unittest.TestCase):
             loader.item_start(n)
             loader.item_done(n)
         loader.item_start("ids/v10")
-        block = loader._frame(0, time.monotonic(), 80)
+        for t in range(20):              # cells crawl toward target per frame
+            block = loader._frame(t, time.monotonic(), 80)
         plain = [ANSI.sub("", l) for l in block]
         # header + ids + tfa + concat — never one line per video
         self.assertEqual(len(block), 4)
@@ -114,8 +118,15 @@ class TestDockerPullBlock(unittest.TestCase):
         self.assertIn("ids 10/30 Preparing v10", plain[1])
         self.assertIn("tfa Waiting", plain[2])
         self.assertIn("concat Waiting", plain[3])
-        self.assertTrue(all(l.startswith("rtsp_streamer  | ")
-                            for l in plain))             # gutter on every line
+        # loader never writes the compose prefix itself
+        self.assertNotIn("rtsp_streamer", "".join(plain))
+        # docker-pull bar: exactly one rising cell per folder
+        bar = re.search(r"\[(.*?)\]", plain[0]).group(1)
+        self.assertEqual(len(bar), 3)
+        self.assertTrue(all(c in loader.RISE for c in bar))
+        self.assertGreater(loader.RISE.index(bar[0]), 0)   # ids progressing
+        self.assertEqual(bar[1], loader.RISE[0])           # tfa untouched
+        self.assertEqual(bar[2], loader.RISE[0])           # concat untouched
 
     def test_rows_change_state_in_place(self):
         loader.set_items(["a/one", "a/two", "b/one"])
@@ -129,6 +140,9 @@ class TestDockerPullBlock(unittest.TestCase):
         self.assertIn("2/3", plain[0])                   # header still first
         self.assertIn("a Ready (2 videos)", plain[1])    # ✔ in its own row
         self.assertIn("b Waiting", plain[2])
+        bar = re.search(r"\[(.*?)\]", plain[0]).group(1)
+        self.assertEqual(bar[0], loader.RISE[-1])        # done folder = full
+        self.assertEqual(bar[1], loader.RISE[0])
 
     def test_group_row_counts_then_final_count(self):
         items = [("mini/{}".format(i), "mini") for i in range(1, 66)]

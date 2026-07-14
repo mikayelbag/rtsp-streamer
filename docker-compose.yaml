@@ -13,10 +13,6 @@ services:
       # prod = progress ticker + stream URLs only (details in workspace/streamer.log)
       # dev  = full logs on stdout, no ticker
       MODE: prod
-      # The progress block paints its own `rtsp_streamer  | ` log gutter so
-      # in-place redraws don't leave a bare column under compose. If you
-      # rename container_name above, match it here (empty = no gutter):
-      # LOG_PREFIX: rtsp_streamer
     # ADVERTISE_IP and the open-file limit are baked into the image.
     volumes:
       - ./video_samples:/app/video_samples:ro   # put source videos here
