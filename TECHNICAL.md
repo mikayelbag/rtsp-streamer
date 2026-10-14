@@ -6,7 +6,7 @@ written so that a junior engineer with no video-streaming background can
 follow along. The user-facing overview (quick start, config reference) lives
 in [`README.md`](README.md); this file is the "why and how" companion.
 
-Version covered: **2.9.0**.
+Version covered: **2.10.0**.
 
 ---
 
@@ -244,12 +244,32 @@ MP4 cannot do this: MP4 files carry edit lists and B-frame reordering
 offsets, and at the loop wrap ffmpeg produces a **non-monotonic DTS** — the
 muxer errors out, the publisher dies, and every connected client is dropped.
 MPEG-TS has no such structure; timestamps restart cleanly and the loop is
-invisible. So every source is converted to `.ts` in the workspace once, then
-looped forever with a cheap `-c copy` publisher.
+invisible. Up to 2.9.0 every source was therefore converted to `.ts` in the
+workspace once, then looped forever with a cheap `-c copy` publisher.
+
+**Direct serving (2.10.0).** A remux-only `.ts` is a byte-for-byte copy of
+the source's frames — it doubled disk use for nothing on any library that
+needs no changes, and the MP4 wrap crash did not reproduce on current
+ffmpeg + mediamtx. So a source that needs no change (no transcode reason,
+container in `DIRECT_EXTS` = mp4/m4v/mov/mkv/ts) is now published straight
+from `video_samples/`. A small `<stem>.ts.direct` JSON sidecar caches the
+decision and the as-is warnings, keyed on the source's mtime + size and
+`keyint`, so cached startups still skip the packet-index scan. Any old
+`stem.ts` remux copy is deleted when a source goes direct.
+
+The safety net is automatic: if a directly-served publisher ever **dies**
+(a crash at the wrap, a stall kill), the supervisor holds that stream's
+restarts, builds the TS copy in a background thread (`materialize_ts()`:
+remux, re-encode if even that fails), repoints every mount served from that
+source at it, and restarts. The TS copy is a normal stamped artifact, so the
+next startup finds it fresh and keeps using it — a bad file costs one
+disconnect, once. AVI and other containers without usable timestamps still
+get the TS copy up front.
 
 ### 7.2 Remux or transcode?
 
-`needs_transcode()` collects reasons; if none, a lossless remux suffices:
+`needs_transcode()` collects reasons; if none, the source is served
+directly (§7.1) — or remuxed, for containers outside `DIRECT_EXTS`:
 
 ```
 force_reencode = true        → transcode ("forced")
@@ -257,10 +277,10 @@ fps / size / bitrate ≠ keep  → transcode (the change requires re-encoding)
 ffprobe can't read it        → transcode ("unreadable")
 codec not h264/hevc          → transcode (not RTSP-friendly as-is)
 source has B-frames          → transcode ("bframes") with camera_grade=true,
-                               else remux + (!) warning (camera realism, below)
+                               else as-is + warning (camera realism, below)
 keyframes > 2×KEYINT apart   → transcode ("gop") with camera_grade=true,
-                               else remux + (!) warning (camera realism, below)
-otherwise                    → remux (-c copy, lossless, fast)
+                               else as-is + warning (camera realism, below)
+otherwise                    → direct (or remux: -c copy, lossless, fast)
 ```
 
 If even the remux fails (some AVIs carry no usable timestamps — ffmpeg says
@@ -283,9 +303,26 @@ keyint=60 : min-keyint=60   IDR exactly every `keyint` frames (config key,
                             default 60 = 2 s @ 30 fps; the join-latency lever)
 scenecut=0                  no surprise keyframes off the cadence
 bframes=0                   no B-frames → no reorder, no reorder errors
+ref=4                       decoder surface pool sized like a camera's
+                            (X264_REF — see below)
 repeat-headers=1            SPS/PPS before every IDR → a mid-stream join
                             can configure its decoder immediately
 ```
+
+**Why `ref=4` (2.10.0).** x264 always writes a VUI `bitstream_restriction`;
+with `bframes=0` it says `max_num_reorder_frames=0`, and at veryfast's
+default `ref=1` the SPS declares one reference frame. FFmpeg's NVDEC sizes
+its surface pool as `ref_frame_count + num_reorder_frames + 2` — **3
+surfaces**. An engine that keeps a few decoded frames in flight (batching,
+an inference queue) exhausts that pool: `No decoder surfaces left`, the
+frame is dropped, and its dependants fail with `Missing reference picture` /
+`decode_slice_header error` / `cuvidDecodePicture … CUDA_ERROR_INVALID_VALUE`.
+Real cameras usually omit `bitstream_restriction`, so FFmpeg derives ~4
+reorder frames from the level and allocates ~7 surfaces — which is why the
+same engine is fine on a camera. `ref=4` (the most 1080p may use inside
+level 4.x) lifts the pool to 6. Reproduced and verified on an RTX 3060 by
+decoding to CUDA frames into NVENC with an 8-frame delay: ref=1 → surface
+errors, ref=4 → clean.
 
 and with `camera_grade = true`, `needs_transcode()` refuses to remux any
 source that itself carries B-frames (`has_b_frames` from ffprobe) or a
@@ -296,11 +333,12 @@ clean picture — no decode-error spam.
 
 **The default: `camera_grade = false` (since 2.5.0).** The realism checks
 (B-frames, long GOP) are *warnings*, not re-encode reasons: the source is
-remuxed as-is (no CPU burn on first run), the warning is recorded in the
-artifact's build stamp, and the URL banner marks the stream with a short
-`(!)` suffix plus one legend line — visible exactly where the URL gets
-copied, no log noise. Setting `camera_grade = true` rebuilds the marked
-artifacts automatically (the stamp remembers). Codec conversion is *not*
+served as-is (no CPU burn on first run), the warning is recorded in the
+build stamp / direct sidecar, and the URL banner lists the affected streams
+once, grouped by reason, below the URLs (`B-frames  a/x  b/y`,
+`long GOP  c/z`) — the URL lines themselves stay bare for copying. Setting
+`camera_grade = true` rebuilds the listed streams automatically (the stamp
+remembers). Codec conversion is *not*
 affected by the setting: a non-h264/hevc source (e.g. MPEG-4 Part 2) always
 re-encodes — that's compatibility, not realism; no engine speaks Xvid over
 RTSP.
@@ -318,15 +356,17 @@ as new as its source (**mtime comparison**), and its **build stamp**
 matches the config.
 
 The stamp is a small `<artifact>.meta` JSON written next to every
-successful build, recording the streamer version and the `keyint` it was
-encoded with. It does two jobs:
+successful build, recording the streamer version, the `keyint` and the full
+x264 parameter string it was encoded with. It does two jobs:
 
 - **No startup rescans.** A stamped artifact is trusted outright; source
   analysis (`needs_transcode()` and its full packet-index GOP scan) runs
   only on a cache miss. Cached startups no longer scale with library size.
-- **`keyint` invalidation.** A stamp whose keyint differs from the config
-  triggers a rebuild — previously a documented footgun (keyint edits
-  silently kept serving the old cadence until the workspace was wiped).
+- **Encoder invalidation.** A stamp whose keyint or x264 params differ from
+  the current ones triggers a rebuild — previously a documented footgun
+  (keyint edits silently kept serving the old cadence until the workspace
+  was wiped). Stamps from before 2.10.0 have no x264 key, so the first
+  2.10.0 start rebuilds every encode once to pick up `ref=4` (§7.2).
 
 Artifacts without a stamp (built by versions before 2.4.0) are verified
 once with `_camera_grade()` (no B-frames, sane keyframe cadence — §7.2) and
@@ -339,12 +379,13 @@ the old cache entry:
 
 | Workspace file | Meaning |
 |---|---|
-| `stem.ts` | plain remux |
+| `stem.ts.direct` | direct-serving sidecar: the original is published, no copy (§7.1) |
+| `stem.ts` | remux (non-direct container, or the TS fallback after a direct publisher died) |
 | `stem__r1280x720_f25_b2000k_enc.ts` | transcode; tags = the settings used |
 | `stem__body_s30c4.ts` | rotation body for `shift_frames=30, copies=4` (§8) |
 | `stem__fwd90.ts` | forward-rotated copy starting at frame 90 (§8) |
 | `stem__mini.ts` / `stem__minip.ts` | mini composite; `p` = probe variant (§9) |
-| `*.ts.meta` | build stamp (version + keyint) for the cache check |
+| `*.ts.meta` | build stamp (version + keyint + x264 params) for the cache check |
 | `*.part<pid>` | in-progress build (temp; swept at startup) |
 
 ### 7.4 Atomic writes
@@ -466,6 +507,15 @@ and duration — know the number on screen, find the video and when it plays.
 stream it is *already connected to* (cold-start timing). The stream shows
 black; you fire a signal; it plays the content once; back to black, re-armed.
 
+**`probe_idle = frame` (2.10.0).** Instead of black, the idle picture is a
+frozen frame of the content: its **first** frame until the first fire
+(decoded once at feeder start, `first_frame()`; black if that fails), and
+after each pass its **last** frame, held until the next fire replays from
+the start. Implemented as one variable in the feeder loop — the idle frame
+is whatever was last written in content mode — so it costs nothing extra
+and stays seamless. The banner's probe heading says which idle each set of
+probes uses.
+
 **The hard requirement is seamlessness** — the client must never disconnect
 or even see a hiccup at the black↔content switches. That eliminates:
 swapping ffmpeg processes (kills the RTSP session), and ffmpeg filter-graph
@@ -566,6 +616,10 @@ The main loop polls once per second:
   (`RESTART_BACKOFF_START/MAX`, `STABLE_RESET_SECONDS`). Backoff prevents a
   broken file from hot-looping ffmpeg spawns; the stable-reset makes an
   occasional crash cheap again.
+- **A directly-served original's publisher died** → instead of the backoff
+  restart, the TS fallback of §7.1: restarts are held while
+  `materialize_ts()` builds the copy on a background thread, then every
+  mount served from that source is repointed at it and restarted.
 - **A stream process hung** (the delivery watchdog) → a publisher can wedge
   without dying — an ffmpeg blocked forever on a socket write, a stuck
   decode — and a process-alive check will never notice: the stream is up, the
@@ -672,7 +726,7 @@ Waiting → Downloading → Pull complete:
 ```
 rtsp_streamer  | [prepare] processing 70 videos... (details: workspace/streamer.log)
 rtsp_streamer  |
-rtsp_streamer  | ⠸ rtsp-streamer v2.9.0 [⣿⣶⡀] 23/70 Preparing      51.4s
+rtsp_streamer  | ⠸ rtsp-streamer [⣿⣶⡀] 23/70 Preparing             51.4s
 rtsp_streamer  |   ✔ ids Ready (3 videos)                          49.3s
 rtsp_streamer  |   ⠸ tfa 2/5 Preparing dalma_fhd                    9.4s
 rtsp_streamer  |   ⠸ mini 16/61 Preparing                          31.0s
@@ -752,12 +806,14 @@ Design notes that matter to a reader:
 |---|---|---|
 | "No usable port among […]" | 3 instances already running, or mediamtx crashed on startup | `workspace/mediamtx_*.yml`, `streamer.log`; §14 |
 | A stream restarts every ~30 s | its prepared file is bad → publisher crash-loops in backoff | `streamer.log` for the ffmpeg stderr |
-| Client sees black on a normal stream | it's a probe stream — check the URL banner for the `(probe — …)` marker | `touch workspace/start` |
+| Client sees black (or a frozen frame) on a normal stream | it's a probe stream — it is listed in the banner's `probe` section | `touch workspace/start` |
 | Probe never fires | signal file outside the feeder's `--signal-file` path (custom workspace?), or the touch predates feeder start (it arms against the current mtime) | re-touch; `streamer.log` |
 | Stream URL 404s / name looks mangled | source filename had characters mediamtx forbids; it was sanitized, possibly deduped (`__2`) | startup log lines `name collision:` / `duplicate mount` |
 | `streamer.log` shows "stalled (no data …s) — killing" | the delivery watchdog caught a hung publisher and restarted it; occasional entries are the system healing itself, repeated ones for the same mount point at a bad file or an overloaded host | §12; the ffmpeg stderr around it |
 | First run very slow | transcodes (codec not h264/hevc, or fps/size/bitrate set) — subsequent runs hit the cache | `streamer.log` `transcoding [reasons]` lines |
 | Changed config, nothing rebuilt | artifacts are cached by setting-tagged names, mtime and the `.meta` build stamp; `fps/size/bitrate` changes rename the artifact and `keyint` changes invalidate the stamp — both rebuild automatically | `force_reencode = true` once, or delete `workspace/` |
+| Engine logs `No decoder surfaces left`, then `Missing reference picture` / `decode_slice_header error` / `cuvidDecodePicture … CUDA_ERROR_INVALID_VALUE` (NVDEC) | pre-2.10.0 encodes declare 1 reference frame + no reorder → a 3-surface NVDEC pool; 2.10.0 encodes with `ref=4` and rebuilds old artifacts on its first start. On an **as-is** stream (listed under "served as-is") the SPS is the source's own — set `camera_grade = true` or `force_reencode = true` for it | §7.2 |
+| Banner/logs show an older version than expected | compose never re-pulls `latest` on its own; the local image is stale | `docker compose pull && docker compose up -d` |
 | Corrupt-looking loop on shifted copies | an old pre-2.3.1 truncated cache file | delete `workspace/` |
 | Engine logs `reference picture missing during reorder` / `mmco: unref short failure` | B-frames reached the reader: pre-2.3.2 cached files (auto-rebuilt on the next 2.3.2 start) or a pre-2.3.2 image. A short burst (<2 s) right at connect on older versions was the mid-GOP join; 2.3.2's camera-grade encode bounds it to a silent ≤2 s wait | §7.2; rerun so the cache migrates |
 

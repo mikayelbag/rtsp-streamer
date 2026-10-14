@@ -158,6 +158,12 @@ class TestValidateConfig(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.check("[folder:ids]\ncopies = x\n")
 
+    def test_probe_idle_values(self):
+        self.check("probe_idle = frame\n")
+        self.check("probe_idle = black\n")
+        with self.assertRaises(SystemExit):
+            self.check("probe_idle = first\n")
+
     def test_unrelated_section_ignored(self):
         self.check("[something_else]\ncopies = not_an_int\n")
 
@@ -239,11 +245,118 @@ class TestIsFresh(unittest.TestCase):
         setts = dict(self.setts, camera_grade=True)
         self.assertFalse(streamer.is_fresh(self.dst, self.src, setts))
 
+    def test_x264_change_invalidates(self):
+        self.touch(self.dst, os.path.getmtime(self.src) + 10)
+        streamer._stamp(self.dst)
+        meta = streamer._read_stamp(self.dst)
+        meta["x264"] = "keyint=60:bframes=0"
+        with open(self.dst + streamer.STAMP_SUFFIX, "w") as f:
+            json.dump(meta, f)
+        self.assertFalse(streamer.is_fresh(self.dst, self.src, self.setts))
+
+    def test_pre_2_10_stamp_without_x264_rebuilds(self):
+        self.touch(self.dst, os.path.getmtime(self.src) + 10)
+        with open(self.dst + streamer.STAMP_SUFFIX, "w") as f:
+            json.dump({"version": "2.9.0", "keyint": streamer.KEYINT}, f)
+        self.assertFalse(streamer.is_fresh(self.dst, self.src, self.setts))
+
     def test_unstamped_no_grade_check_gets_stamped(self):
         self.touch(self.dst, os.path.getmtime(self.src) + 10)
         self.assertTrue(
             streamer.is_fresh(self.dst, self.src, self.setts, check_grade=False))
         self.assertIsNotNone(streamer._read_stamp(self.dst))
+
+
+class TestDirect(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.src = os.path.join(self.dir.name, "src.mp4")
+        self.ts = os.path.join(self.dir.name, "src.ts")
+        with open(self.src, "wb") as f:
+            f.write(b"s")
+        self.setts = {"force_reencode": False, "camera_grade": False}
+
+    def test_no_sidecar_undecided(self):
+        self.assertIsNone(streamer._direct_cached(self.ts, self.src, self.setts))
+
+    def test_roundtrip_keeps_warnings(self):
+        streamer._write_direct(self.ts, self.src, ["bframes"])
+        self.assertEqual(
+            streamer._direct_cached(self.ts, self.src, self.setts), ["bframes"])
+
+    def test_clean_source_empty_warnings(self):
+        streamer._write_direct(self.ts, self.src, [])
+        self.assertEqual(streamer._direct_cached(self.ts, self.src, self.setts), [])
+
+    def test_replaced_source_undecided(self):
+        streamer._write_direct(self.ts, self.src, [])
+        with open(self.src, "ab") as f:
+            f.write(b"more")
+        self.assertIsNone(streamer._direct_cached(self.ts, self.src, self.setts))
+
+    def test_camera_grade_rejects_warned(self):
+        streamer._write_direct(self.ts, self.src, ["gop"])
+        setts = dict(self.setts, camera_grade=True)
+        self.assertIsNone(streamer._direct_cached(self.ts, self.src, setts))
+
+    def test_force_reencode_undecided(self):
+        streamer._write_direct(self.ts, self.src, [])
+        setts = dict(self.setts, force_reencode=True)
+        self.assertIsNone(streamer._direct_cached(self.ts, self.src, setts))
+
+
+class TestBanner(unittest.TestCase):
+    BASE = "rtsp://10.0.0.1:41000"
+
+    def lines(self, pubs=(), feeders=(), minis=(), mans=()):
+        return streamer.banner_lines(self.BASE, 41000, "tcp", list(pubs),
+                                     list(feeders), set(minis), list(mans))
+
+    def test_url_lines_are_bare(self):
+        out = self.lines(pubs=[("/a/x", ["bframes"]), ("/a/y", [])])
+        self.assertIn("  rtsp://10.0.0.1:41000/a/x", out)
+        self.assertIn("  rtsp://10.0.0.1:41000/a/y", out)
+
+    def test_warnings_grouped_by_reason(self):
+        out = self.lines(pubs=[("/a/x", ["bframes"]), ("/a/y", ["gop"]),
+                               ("/a/z", ["bframes", "gop"])])
+        bf = [l for l in out if l.strip().startswith("B-frames")]
+        gop = [l for l in out if l.strip().startswith("long GOP")]
+        self.assertEqual(len(bf), 1)
+        self.assertIn("a/x", bf[0])
+        self.assertIn("a/z", bf[0])
+        self.assertIn("a/y", gop[0])
+        self.assertNotIn("a/x", gop[0])
+
+    def test_no_warning_block_when_clean(self):
+        out = self.lines(pubs=[("/a/x", [])])
+        self.assertFalse(any("as-is" in l for l in out))
+
+    def test_probe_fire_instructions_once(self):
+        out = self.lines(feeders=[("/p/a", "black"), ("/p/b", "black")])
+        self.assertEqual(sum("touch workspace" in l for l in out), 2)
+        self.assertIn("  rtsp://10.0.0.1:41000/p/a", out)
+        self.assertTrue(any("black until fired" in l for l in out))
+
+    def test_probe_frame_idle_heading(self):
+        out = self.lines(feeders=[("/p/a", "frame")])
+        self.assertTrue(any("frozen frame until fired" in l for l in out))
+
+    def test_mini_run_collapses(self):
+        out = self.lines(pubs=[("/mini/{}".format(i), []) for i in range(1, 11)],
+                         minis={"mini"})
+        self.assertIn("  rtsp://10.0.0.1:41000/mini/1", out)
+        self.assertIn("  rtsp://10.0.0.1:41000/mini/10", out)
+        self.assertTrue(any("(8 more)" in l for l in out))
+        self.assertNotIn("  rtsp://10.0.0.1:41000/mini/5", out)
+
+    def test_lines_fit_pty(self):
+        names = [("/folder/clip_{:03d}".format(i), ["bframes"]) for i in range(40)]
+        out = self.lines(pubs=names)
+        warn = [l for l in out if l.startswith("    ") or l.startswith(" " * 15)]
+        self.assertTrue(warn)
+        self.assertTrue(all(len(l) <= streamer.BANNER_W for l in warn))
 
 
 class TestNeedsTranscode(unittest.TestCase):
@@ -294,6 +407,8 @@ class TestKeyint(unittest.TestCase):
         self.assertIn("keyint=30:min-keyint=30", streamer.X264_PARAMS)
         self.assertIn("bframes=0", streamer.X264_PARAMS)
         self.assertIn("repeat-headers=1", streamer.X264_PARAMS)
+        # NVDEC surface pool: ref_frame_count must exceed 1 (see X264_REF)
+        self.assertIn("ref={}".format(streamer.X264_REF), streamer.X264_PARAMS)
 
 
 class TestParsePorts(unittest.TestCase):

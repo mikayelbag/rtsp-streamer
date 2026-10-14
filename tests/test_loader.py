@@ -128,6 +128,17 @@ class TestDockerPullBlock(unittest.TestCase):
         self.assertEqual(bar[1], loader.RISE[0])           # tfa untouched
         self.assertEqual(bar[2], loader.RISE[0])           # concat untouched
 
+    def test_header_has_no_version_and_done_cells_green(self):
+        loader.set_items(["a/one", "b/one"])
+        loader.item_start("a/one")
+        loader.item_done("a/one")
+        loader.item_start("b/one")
+        head = loader._frame(0, time.monotonic(), 80)[0]
+        plain = ANSI.sub("", head)
+        self.assertNotRegex(plain, r"v\d+\.\d+")
+        self.assertIn(loader.GREEN + loader.RISE[8] + loader.RESET, head)
+        self.assertIn("[" + loader.RISE[8], plain)
+
     def test_rows_change_state_in_place(self):
         loader.set_items(["a/one", "a/two", "b/one"])
         block0 = loader._frame(0, time.monotonic(), 80)

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Loader — docker-pull-style progress display for prod mode.
 
-    rtsp_streamer  | ⠸ rtsp-streamer v2.9.0 [⣿⣶⡀⠀] 23/70 Preparing  51.4s
+    rtsp_streamer  | ⠸ rtsp-streamer [⣿⣶⡀⠀] 23/70 Preparing          51.4s
     rtsp_streamer  |   ✔ ids Ready (3 videos)                        49.3s
     rtsp_streamer  |   ⠸ tfa 2/5 Preparing dalma_fhd                  9.4s
     rtsp_streamer  |   ⠸ mini 16/61 Preparing                        31.0s
     rtsp_streamer  |   - concat Waiting
 
 Usage:
-    handle = loader.start(subtitle="v2.9.0")
+    handle = loader.start()
     loader.set_items([("ids/first", None), ("mini/1", "mini"), ...])
     loader.item_start("mini/1")                           # worker began it
     loader.item_done("mini/1")                            # worker finished it
@@ -32,7 +32,9 @@ Design notes:
     `[⣿⣶⡀⠀]` reads folder 1 done, folder 2 ~70%, folder 3 started,
     folder 4 waiting. While a folder holds on a slow video its cell
     creeps up a little, capped below the next video's share, so a cell
-    never claims work that isn't done. Monotonic per folder.
+    never claims work that isn't done. Monotonic per folder. Cells are
+    cyan while their folder prepares and turn green once it is Ready —
+    the same green as the ✔ marks.
   - Compose-prefix safety: under `docker compose up` every
     `\\n`-terminated chunk gets the `rtsp_streamer  | ` prefix from
     compose itself. Each block line therefore ends in a real newline
@@ -102,7 +104,6 @@ ST_WAIT, ST_RUN, ST_DONE = 0, 1, 2
 _lock = threading.Lock()
 _units = []                   # ordered folder rows: {label, members, group}
 _state = {}                   # member name -> [state, t_start, t_end]
-_subtitle = ""
 
 
 def set_items(entries):
@@ -256,8 +257,9 @@ def _folder_row(u, view, spin, now, w):
 
 def _cells(units, views):
     """The header bar: one braille cell per folder, rising bottom-up with
-    that folder's own progress — docker pull's per-layer cells."""
-    out = []
+    that folder's own progress — docker pull's per-layer cells. Returns
+    (plain, colored): plain is measured for layout, colored is painted."""
+    out, painted = [], []
     for u, v in zip(units, views):
         st, done, total = v[0], v[1], v[2]
         if st == ST_DONE:
@@ -267,7 +269,12 @@ def _cells(units, views):
             fill = _advance(shown, done, total) if st == ST_RUN else 0.0
         _frame.fills[u["label"]] = fill
         out.append(RISE[int(fill)])
-    return "".join(out)
+        if st != ST_WAIT:
+            painted.append((GREEN if st == ST_DONE else CYAN)
+                           + RISE[int(fill)] + RESET)
+        else:
+            painted.append(RISE[int(fill)])
+    return "".join(out), "".join(painted)
 
 
 def _frame(tick, t0, cols, rows=24):
@@ -278,7 +285,6 @@ def _frame(tick, t0, cols, rows=24):
     with _lock:
         units = [dict(u, members=list(u["members"])) for u in _units]
         state = {n: list(_state[n]) for n in _state}
-        subtitle = _subtitle
     now = time.monotonic()
     spin = SPINNER[tick % len(SPINNER)]
     w = cols - 1
@@ -289,12 +295,16 @@ def _frame(tick, t0, cols, rows=24):
 
     # header: spinner, name, per-folder cells, counts, verb, total elapsed
     finished = total > 0 and done >= total
-    head = "{} rtsp-streamer {} [{}] {}/{} {}".format(
-        TICK if finished else spin, subtitle, _cells(units, views),
+    cells, painted = _cells(units, views)
+    head = "{} rtsp-streamer [{}] {}/{} {}".format(
+        TICK if finished else spin, cells,
         done, total, "Ready" if finished else "Preparing")
-    block = [_row(head, _elapsed(now - t0), w,
-                  mark=TICK if finished else spin,
-                  mcolor=GREEN if finished else CYAN)]
+    head = _row(head, _elapsed(now - t0), w,
+                mark=TICK if finished else spin,
+                mcolor=GREEN if finished else CYAN)
+    # paint the cells after layout (_row measures plain text); a header
+    # truncated mid-bar simply stays uncolored
+    block = [head.replace("[{}]".format(cells), "[{}]".format(painted), 1)]
 
     # fold surplus Waiting rows so the block always fits the screen
     fit = max(2, rows - 2)                     # lines available to the block
@@ -413,12 +423,9 @@ def _run(ev):
             out.flush()
 
 
-def start(subtitle=""):
+def start():
     """Start the loader; returns a handle for stop(). Safe to call only when
     stdout is a real terminal (streamer.py checks isatty first)."""
-    global _subtitle
-    with _lock:
-        _subtitle = str(subtitle)
     ev = threading.Event()
     th = threading.Thread(target=_run, args=(ev,), daemon=True)
     th.start()

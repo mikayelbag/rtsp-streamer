@@ -2,6 +2,8 @@
 """
 Probe feeder — one continuous RTSP publish session that shows black until a
 signal, then plays the content once, then returns to black (re-armed).
+With --idle frame the idle picture is a frozen frame instead of black: the
+content's first frame until the first fire, its last frame after each pass.
 
 Used by streamer.py for `probe = true` streams. The point is a *seamless* switch:
 the engine under test connects once and never disconnects when black flips to
@@ -43,6 +45,21 @@ def black_frame(w, h):
     ysize = w * h
     csize = ysize // 4
     return bytes([16]) * ysize + bytes([128]) * (csize * 2)
+
+
+def first_frame(args, frame_bytes):
+    """The content's first frame as raw yuv420p (scaled to the sink size),
+    or None if it can't be decoded — the caller then idles on black."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+             "-i", args.content, "-frames:v", "1",
+             "-vf", "scale={}:{}".format(args.width, args.height),
+             "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"],
+            capture_output=True, timeout=60)
+    except Exception:
+        return None
+    return r.stdout if len(r.stdout) == frame_bytes else None
 
 
 def signal_mtime(path):
@@ -170,6 +187,9 @@ def main():
     ap.add_argument("--x264-params", required=True,
                     help="x264 param string from streamer.py (X264_PARAMS)")
     ap.add_argument("--preset", default="veryfast")
+    ap.add_argument("--idle", choices=("black", "frame"), default="black",
+                    help="idle picture: black, or the content's first frame "
+                         "(then its last frame after each pass)")
     ap.add_argument("--signal-file", action="append", required=True,
                     dest="signal_files",
                     help="fire on an mtime edge of any of these (repeatable)")
@@ -177,6 +197,9 @@ def main():
 
     frame_bytes = args.width * args.height * 3 // 2
     black = black_frame(args.width, args.height)
+    idle = black
+    if args.idle == "frame":
+        idle = first_frame(args, frame_bytes) or black
     period = 1.0 / args.fps if args.fps > 0 else 1.0 / 30
     poll_every = max(1, int(round(0.05 / period)))   # check the signal ~20x/s
 
@@ -211,11 +234,13 @@ def main():
                 item = content.poll_frame()
                 if item is None:
                     content.close()
-                    content = None      # content done -> back to black
+                    content = None      # content done -> back to idle
                 elif item:
                     frame = item
+                    if args.idle == "frame":
+                        idle = item     # pass ends frozen on its last frame
             if frame is None:
-                frame = black
+                frame = idle
 
             try:
                 sink.stdin.write(frame)

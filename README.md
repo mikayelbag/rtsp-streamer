@@ -91,8 +91,9 @@ overrides. Key settings:
 | `shift_frames` | `0` | phase offset between copies — simulate out-of-phase cameras |
 | `fps` / `size` / `bitrate_kbps` | `keep` | re-encode targets (`keep` = stream as-is) |
 | `force_reencode` | `false` | always normalise to H.264, 2 s keyframes |
-| `camera_grade` | `false` | `true` = re-encode sources with B-frames / long GOP so streams behave exactly like real IP cameras; `false` (default) = serve them as-is — faster first run, the URL gets a `(!)` marker, mid-stream joins may glitch |
+| `camera_grade` | `false` | `true` = re-encode sources with B-frames / long GOP so streams behave exactly like real IP cameras; `false` (default) = serve them as-is — faster first run, listed under "served as-is" in the banner, mid-stream joins may glitch |
 | `probe` | `false` | black until a signal, then play once (see below) |
+| `probe_idle` | `black` | probe idle picture: `black`, or `frame` = first frame frozen until fired, last frame frozen after each pass |
 | `mini` | `false` | short-clip 1-minute loop: frozen first frame 10 s + clip + black; streams mount as numbers `/mini/1…N` (see below) |
 | `concat` | `false` | chain a folder's videos into ONE looping stream `/<folder>/chain` (see below) |
 
@@ -134,7 +135,19 @@ to black, re-armed. For engine cold-start timing on an already-connected stream.
 ```bash
 # fire every armed probe stream at once:
 touch workspace/start
+# fire just one camera (rtsp://…/ptd/dron_gun):
+touch workspace/start_ptd_dron_gun
 # re-touch to fire again
+```
+
+**Frozen frame instead of black** — `probe_idle = frame` shows the clip's
+**first frame** frozen until you fire, plays the clip once, then holds its
+**last frame** until the next fire (which replays from the start):
+
+```ini
+[folder:ptd]
+probe = true
+probe_idle = frame
 ```
 
 - **Seamless** — a per-stream feeder owns one continuous publish session and
@@ -240,21 +253,25 @@ already make a restarted recorder resume its playlist correctly.
 
 ## Behaviour
 
-- **Seamless looping** — every video is prepared as MPEG-TS in `workspace/`
-  (lossless `-c copy` remux when the source already looks camera-like,
-  re-encode otherwise). TS is what makes `-stream_loop -1` loop without
-  the MP4 non-monotonic-DTS crash that disconnects every client at the wrap.
-  Prepared files are cached and rebuilt only when the source is newer.
-- **Camera-grade H.264 (opt-in)** — with `camera_grade = true` streams mimic
-  real IP cameras: **no B-frames**, a fixed 2 s IDR cadence, SPS/PPS repeated
-  before every keyframe; sources that don't already look like that are
-  re-encoded instead of remuxed, and a client joining mid-stream waits at
+- **No duplicate storage** — a video that needs no change is streamed
+  straight from `video_samples/`; nothing is copied into `workspace/`.
+  Only re-encodes (settings, unsupported codec, `camera_grade`) and derived
+  streams (mini, concat, shifted copies) live there, cached and rebuilt only
+  when the source is newer. Should a directly-served file ever crash its
+  publisher, that stream switches by itself to a loop-safe MPEG-TS copy and
+  stays on it.
+- **Camera-grade H.264** — every re-encode mimics a real IP camera: **no
+  B-frames**, a fixed 2 s IDR cadence, SPS/PPS repeated before every
+  keyframe, and enough reference frames that NVDEC-based engines get a
+  camera-sized decoder pool (no `No decoder surfaces left`). With
+  `camera_grade = true` sources that don't already look like that are
+  re-encoded instead of served as-is, and a client joining mid-stream waits at
   most one keyframe interval (≤2 s) for a clean picture instead of spraying
   `reference picture missing during reorder` decode errors. By default
   (`camera_grade = false`) such sources are served **as-is** — no re-encode
-  on first run — and their URLs carry a `(!)` marker warning that mid-stream
-  joins may glitch. Flipping the setting rebuilds the affected cache entries
-  automatically.
+  on first run — and the banner lists them under "served as-is", grouped by
+  reason, since mid-stream joins may glitch. Flipping the setting rebuilds
+  the affected streams automatically.
 - **Crash-safe cache** — prepared files are written to a temp name and renamed
   into place atomically, so a container killed mid-transcode never leaves a
   truncated file that would be served on the next run.
@@ -292,7 +309,10 @@ Deep-dive documentation of every internal mechanism lives in
 | Tag | What |
 |---|---|
 | `latest` | the current release |
-| `X.Y.Z` (e.g. `2.9.0`) | pinned release versions |
+| `X.Y.Z` (e.g. `2.10.0`) | pinned release versions |
+
+`latest` is not re-pulled automatically — after a release run
+`docker compose pull` (or `docker pull mikayelbag/rtsp-streamer:latest`).
 
 ## Security note
 

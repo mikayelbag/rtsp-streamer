@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RTSP streamer 2.9.0
+RTSP streamer 2.10.0
 
 Serves every video found under the videos folder as a looping live RTSP
 stream. For each stream this is the equivalent of:
@@ -19,9 +19,9 @@ Modes (MODE environment variable):
     dev             everything on stdout, no animation
 
 Features on top of the bare ffmpeg command:
-  - every video is prepared into the workspace as MPEG-TS (lossless remux
-    when possible) so -stream_loop loops seamlessly without the MP4
-    non-monotonic-DTS crash that disconnects clients at the loop point
+  - a video that needs no change is published straight from the videos
+    folder (no workspace copy); should its publisher die, the supervisor
+    switches it to a loop-safe MPEG-TS copy built on the spot
   - transcode only when needed (fps / size / bitrate change, unsupported
     codec, or force_reencode=true); results are cached and reused. Each
     artifact carries a .meta build stamp, so cached runs skip the packet
@@ -30,7 +30,9 @@ Features on top of the bare ffmpeg command:
   - shift_frames: phase offset between copies (copy i starts at frame i*shift;
                   forward-rotated, no loop drift — simulates out-of-phase cameras)
   - probe mode:    streams black until `touch workspace/start`, then plays the
-                   (phase-shifted) content once and returns to black, re-armed
+                   (phase-shifted) content once and returns to black, re-armed;
+                   probe_idle = frame idles on a frozen frame instead (first
+                   frame before the first fire, last frame after each pass)
   - mini mode:     short-clip 1-minute loop = first frame frozen 10s + clip +
                    black; composes with probe (fire -> black -> frozen -> clip
                    -> black). Mini streams mount as numbers (/mini/1, /mini/2,
@@ -70,13 +72,14 @@ import signal
 import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import traceback
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "2.9.0"
+VERSION = "2.10.0"
 SIGNAL_FILE = "start"       # touch workspace/start to fire armed probe streams
 PORT_FILE = ".port"         # bound RTSP port, written for the Docker healthcheck
 X264_PRESET = "veryfast"
@@ -87,6 +90,17 @@ X264_PRESET = "veryfast"
 # scenecut=0 + min-keyint pin the IDR cadence exactly like a camera, and
 # repeat-headers=1 puts SPS/PPS before every IDR so a mid-stream join can
 # configure the decoder without relying on the SDP.
+#
+# ref=X264_REF sizes the decoder's surface pool. x264 always writes a VUI
+# bitstream_restriction, and with bframes=0 that says max_num_reorder_frames=0;
+# FFmpeg's NVDEC then allocates ref_frame_count + num_reorder_frames + 2
+# surfaces — 3 at veryfast's default ref=1. An engine that holds a few
+# decoded frames in flight runs the pool dry: "No decoder surfaces left",
+# then "Missing reference picture" / "decode_slice_header error" as the
+# dropped frame's dependants fail. Real cameras usually omit the restriction,
+# so FFmpeg derives ~4 reorder frames from the level and allocates ~7. ref=4
+# is the most a 1080p stream may use within level 4.x and lifts the pool to 6.
+X264_REF = 4
 KEYINT = None               # set by _set_keyint below; config key `keyint`
 X264_PARAMS = None
 
@@ -99,7 +113,7 @@ def _set_keyint(n):
     global KEYINT, X264_PARAMS
     KEYINT = n
     X264_PARAMS = ("keyint={0}:min-keyint={0}:scenecut=0:bframes=0:"
-                   "repeat-headers=1").format(n)
+                   "ref={1}:repeat-headers=1").format(n, X264_REF)
 
 
 _set_keyint(60)
@@ -142,7 +156,8 @@ def say(msg=""):
 # ---------------------------------------------------------------- config ----
 
 SETTING_KEYS = ("copies", "shift_frames", "fps", "size", "bitrate_kbps", "probe",
-                "force_reencode", "mini", "concat", "camera_grade")
+                "force_reencode", "mini", "concat", "camera_grade", "probe_idle")
+PROBE_IDLE = ("black", "frame")
 
 BOOL_KEYS = ("probe", "force_reencode", "mini", "concat", "camera_grade")
 BOOL_WORDS = ("1", "true", "yes", "on", "0", "false", "no", "off")
@@ -195,6 +210,9 @@ def validate_config(cfg):
             elif key == "size":
                 if v.lower() != "keep" and not re.fullmatch(r"\d+x\d+", v.lower()):
                     err = "must be 'keep' or WIDTHxHEIGHT (e.g. 1920x1080)"
+            elif key == "probe_idle":
+                if v.lower() not in PROBE_IDLE:
+                    err = "must be 'black' or 'frame'"
             elif key == "bitrate_kbps":
                 if v.lower() != "keep" and not re.fullmatch(r"\d+", v):
                     err = "must be 'keep' or an integer (kbps)"
@@ -251,6 +269,9 @@ def settings_for(cfg, folder, stem):
         # as-is (fast first run, (!) marker in the banner); set true to force
         # strict real-camera H.264 everywhere
         "camera_grade": False,
+        # probe streams before a fire: "black", or "frame" = the clip's first
+        # frame frozen, and after each pass its last frame frozen
+        "probe_idle": "black",
     }
     apply_section(cfg, "streamer", s)
     apply_section(cfg, "folder:{}".format(folder), s)
@@ -442,7 +463,7 @@ def _stamp(dst, warn=None, extra=None):
     realism issues (B-frames / long GOP) in the file — reused for the URL
     banner marker on cached runs, and it makes the artifact stale the moment
     camera_grade is switched back to true."""
-    meta = {"version": VERSION, "keyint": KEYINT}
+    meta = {"version": VERSION, "keyint": KEYINT, "x264": X264_PARAMS}
     if warn:
         meta["warn"] = warn
     if extra:
@@ -462,6 +483,18 @@ def _read_stamp(dst):
         return None
 
 
+def _stamp_stale(meta):
+    """Reason string when a stamped artifact was built with encoder settings
+    that no longer match (keyint or the x264 params), else None. Stamps from
+    before 2.10.0 carry no x264 key — their encodes lack the ref fix, so
+    they rebuild once."""
+    if meta.get("keyint") != KEYINT:
+        return "keyint changed ({} -> {})".format(meta.get("keyint"), KEYINT)
+    if meta.get("x264") != X264_PARAMS:
+        return "encoder settings changed"
+    return None
+
+
 def _commit(tmp, dst):
     """Atomically publish a finished build and stamp it."""
     os.replace(tmp, dst)
@@ -472,7 +505,7 @@ def is_fresh(dst, src, setts, check_grade=True):
     """The one cache-validity check for every prepared artifact.
 
     Fresh = not force_reencode, dst exists and is at least as new as src, and
-    the build stamp's keyint matches the config. Artifacts without a stamp
+    the build stamp's keyint and x264 params match. Artifacts without a stamp
     (built by older versions) are verified once with the packet-index scan
     (_camera_grade) and stamped if they pass — an old workspace migrates
     itself and is never rescanned again. A stamp with a different keyint
@@ -493,9 +526,9 @@ def is_fresh(dst, src, setts, check_grade=True):
         return False                        # dst (or src) missing
     meta = _read_stamp(dst)
     if meta is not None:
-        if meta.get("keyint") != KEYINT:
-            log("keyint changed ({} -> {}), rebuilding: {}".format(
-                meta.get("keyint"), KEYINT, dst))
+        why = _stamp_stale(meta)
+        if why:
+            log("{}, rebuilding: {}".format(why, dst))
             return False
         if setts["camera_grade"] and meta.get("warn"):
             log("camera_grade now enforced, rebuilding as-is artifact: {}".format(dst))
@@ -690,6 +723,68 @@ def remux_to_ts(src, dst):
     return True
 
 
+# Direct serving: a source that needs no change is published straight from
+# video_samples instead of from a TS copy in the workspace — the copy doubled
+# disk use. A small sidecar (<ts_path>.direct) caches the decision and the
+# as-is warnings, so cached runs skip the packet-index scan just like a
+# stamped artifact does. AVI and friends keep the up-front TS copy (no usable
+# timestamps for a -c copy publish).
+DIRECT_EXTS = (".mp4", ".m4v", ".mov", ".mkv", ".ts")
+DIRECT_SUFFIX = ".direct"
+
+
+def _src_sig(src):
+    st = os.stat(src)
+    return {"src_mtime": st.st_mtime, "src_size": st.st_size}
+
+
+def _write_direct(ts_path, src, warns):
+    meta = {"version": VERSION, "keyint": KEYINT, "src": src}
+    meta.update(_src_sig(src))
+    if warns:
+        meta["warn"] = warns
+    try:
+        with open(ts_path + DIRECT_SUFFIX, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+    except OSError:
+        pass    # undecided next run -> just re-analysed
+
+
+def _direct_cached(ts_path, src, setts):
+    """The cached direct-serving decision for src: its as-is warnings ([]
+    when clean), or None when there is no valid decision (no sidecar, source
+    replaced or touched, keyint changed — the GOP verdict depends on it — or
+    camera_grade now forbids the as-is issues it recorded)."""
+    try:
+        with open(ts_path + DIRECT_SUFFIX, encoding="utf-8") as f:
+            meta = json.load(f)
+        sig = _src_sig(src)
+    except (OSError, ValueError):
+        return None
+    if (setts["force_reencode"] or meta.get("src") != src
+            or meta.get("keyint") != KEYINT
+            or any(meta.get(k) != v for k, v in sig.items())):
+        return None
+    warns = meta.get("warn") or []
+    if setts["camera_grade"] and warns:
+        return None
+    return warns
+
+
+def materialize_ts(src, ts_path, setts, warns):
+    """Fallback for a directly-served original whose publisher died: build
+    the TS copy (remux, re-encode if even that fails) that it is served from
+    from now on — the next startup finds it fresh and keeps using it."""
+    log("direct publish of {} failed — building TS copy {}".format(src, ts_path))
+    _rm(ts_path + DIRECT_SUFFIX)
+    if remux_to_ts(src, ts_path):
+        if warns:
+            _stamp(ts_path, warn=warns)
+        return True
+    log("remux failed, re-encoding instead: {}".format(src))
+    return transcode(src, ts_path, setts, ffprobe_info(src))
+
+
 # ---------------------------------------------------------------- mini ------
 
 def build_mini(src, dst, info, with_tail_black):
@@ -830,7 +925,7 @@ def prepare_concat(cfg, workspace, folder, items):
     fresh = (not setts["force_reencode"]
              and os.path.isfile(chain)
              and meta is not None
-             and meta.get("keyint") == KEYINT
+             and not _stamp_stale(meta)
              and meta.get("segments") == seg_names
              and os.path.getmtime(chain) >= max(
                  os.path.getmtime(s) for _, _, s in segs))
@@ -875,7 +970,7 @@ def prepare_concat(cfg, workspace, folder, items):
 
     mount = "/{}/chain".format(folder)
     if setts["probe"]:
-        return [], [(mount, chain, w, h, fps)]
+        return [], [(mount, chain, w, h, fps, setts["probe_idle"])]
     return [(mount, chain, [])], []
 
 
@@ -949,9 +1044,10 @@ def publish_cmd(src, url):
             "-f", "rtsp", "-rtsp_transport", "tcp", url]
 
 
-def feeder_cmd(content, url, w, h, fps, signal_paths):
-    """Probe feeder: black until any of signal_paths is touched, then content
-    once, repeat (one continuous publish session — see probe_feeder.py).
+def feeder_cmd(content, url, w, h, fps, signal_paths, idle="black"):
+    """Probe feeder: idle (black, or a frozen frame with idle="frame") until
+    any of signal_paths is touched, then content once, repeat (one
+    continuous publish session — see probe_feeder.py).
     Two signal files per stream: the shared global one (fires every probe at
     once) and the stream's own (fires just this camera — no cross-talk)."""
     feeder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_feeder.py")
@@ -959,7 +1055,7 @@ def feeder_cmd(content, url, w, h, fps, signal_paths):
            "--content", content, "--url", url,
            "--width", str(w), "--height", str(h),
            "--fps", str(fps), "--x264-params", X264_PARAMS,
-           "--preset", X264_PRESET]
+           "--preset", X264_PRESET, "--idle", idle]
     for sp in signal_paths:
         cmd += ["--signal-file", sp]
     return cmd
@@ -970,9 +1066,11 @@ def feeder_cmd(content, url, w, h, fps, signal_paths):
 def prepare_source(cfg, workspace, src, folder, stem, mount_stem=None):
     """Prepare one source video end-to-end (transcode/remux, mini composite,
     rotation body, forward-rotated copies) and return its streams as
-    (publishers [(mount, file, warns)], feeders [(mount, file, w, h, fps)]).
+    (publishers [(mount, file, warns, fallback)],
+     feeders [(mount, file, w, h, fps, idle)]).
     warns lists realism issues kept in an as-is file (camera_grade=false) —
-    surfaced as a (!) marker on the URL banner. Touches only this video's
+    listed under the URL banner. fallback is set when `file` is the original
+    served directly: (src, ts_path, setts, warns) for materialize_ts(). Touches only this video's
     workspace files — independent videos can be prepared in parallel.
     mount_stem overrides the RTSP mount name only (mini numbering); workspace
     artifacts stay named by the real stem, so a reordered library never
@@ -994,11 +1092,17 @@ def prepare_source(cfg, workspace, src, folder, stem, mount_stem=None):
     # the cache so force doesn't appear to do nothing until the workspace
     # is deleted by hand.)
     warns = []
+    ts_path = play_path           # workspace TS; play_path becomes src when direct
+    direct_warns = _direct_cached(ts_path, src, setts)
     if is_fresh(play_path, src, setts):
         log("cached: {}".format(play_path))
         # as-is artifact (camera_grade=false): its realism issues were
         # recorded in the stamp at build time — reuse them for the banner
         warns = (_read_stamp(play_path) or {}).get("warn") or []
+        _rm(ts_path + DIRECT_SUFFIX)   # a fallback TS supersedes direct serving
+    elif direct_warns is not None:
+        log("cached: direct {}".format(src))
+        warns, play_path = direct_warns, src
     else:
         info = ffprobe_info(src)
         reasons, warns = needs_transcode(src, setts, info)
@@ -1007,6 +1111,17 @@ def prepare_source(cfg, workspace, src, folder, stem, mount_stem=None):
             warns = []   # a re-encode normalises everything
             if not transcode(src, play_path, setts, info):
                 return pubs, feeders
+        elif src.lower().endswith(DIRECT_EXTS):
+            # nothing to change: serve the original in place instead of a
+            # TS copy of it (half the disk). Should its publisher ever die
+            # (the old MP4 loop-wrap failure), the supervisor builds the TS
+            # copy then and switches the stream over — see materialize_ts().
+            log("serving original directly{}: {}".format(
+                " as-is [{}]".format(",".join(warns)) if warns else "", src))
+            _write_direct(ts_path, src, warns)
+            _rm(ts_path)                    # pre-2.10 remux copy, now dead weight
+            _rm(ts_path + STAMP_SUFFIX)
+            play_path = src
         else:
             log("remuxing to ts: {} -> {}".format(src, play_path))
             # Stream-copy remux fails on containers with no usable
@@ -1023,6 +1138,8 @@ def prepare_source(cfg, workspace, src, folder, stem, mount_stem=None):
                 log("serving as-is [{}] (camera_grade=false): {}".format(
                     ",".join(warns), play_path))
                 _stamp(play_path, warn=warns)
+    # direct-served original: what the supervisor needs to fall back to a TS
+    fallback = (src, ts_path, setts, warns) if play_path == src else None
 
     # shift_frames > 0 puts copies out of phase. A runtime -ss seek can't
     # do this: a stream-copy seek snaps to the nearest keyframe, so a
@@ -1101,12 +1218,14 @@ def prepare_source(cfg, workspace, src, folder, stem, mount_stem=None):
         if setts["probe"]:
             # the feeder re-encodes through its own sink, so served output
             # is always camera-grade regardless of the file's warnings
-            feeders.append((mount, src_file, cinfo[1], cinfo[2], cinfo[3]))
+            feeders.append((mount, src_file, cinfo[1], cinfo[2], cinfo[3],
+                            setts["probe_idle"]))
         else:
             # derived files (mini/body/fwd) are re-encoded and clean; only
             # the untouched as-is play file carries its realism warnings
             pubs.append((mount, src_file,
-                         warns if src_file == play_path else []))
+                         warns if src_file == play_path else [],
+                         fallback if src_file == play_path else None))
     return pubs, feeders
 
 
@@ -1183,6 +1302,76 @@ def api_paths(api_port):
         page += 1
         if page >= int(data.get("pageCount") or 1):
             return out
+
+
+WARN_TEXT = {"bframes": "B-frames", "gop": "long GOP"}
+BANNER_W = 78      # ptyrun's pty is 80 columns; banner lines stay inside it
+
+
+def _url_rows(base, mounts, mini_folders):
+    """URL lines for `mounts` in order. A numbered mini folder's run
+    collapses to its first and last URL with a count between them — dozens
+    of URLs differing only by index would flood the screen (manifest.txt
+    keeps the full map)."""
+    order, runs = [], {}
+    for m in mounts:
+        mm = re.match(r"^/(.+)/\d+$", m)
+        if mm and mm.group(1) in mini_folders:
+            if mm.group(1) not in runs:
+                order.append(("run", mm.group(1)))
+                runs[mm.group(1)] = []
+            runs[mm.group(1)].append(m)
+        else:
+            order.append(("url", m))
+    out = []
+    for kind, v in order:
+        if kind == "url":
+            out.append("  {}{}".format(base, v))
+            continue
+        run = runs[v]
+        if len(run) <= 3:
+            out += ["  {}{}".format(base, m) for m in run]
+            continue
+        out += ["  {}{}".format(base, run[0]),
+                "   ⋮  {} … {}  ({} more)".format(run[1], run[-2], len(run) - 2),
+                "  {}{}".format(base, run[-1])]
+    return out
+
+
+def banner_lines(base, port, transport, pub_mounts, feeder_mounts,
+                 mini_folders, man_folders):
+    """The "streams ready" banner. URL lines carry nothing but the URL, so
+    they copy cleanly; per-stream notes are gathered once below them:
+    probe fire instructions in the probe section, as-is warnings grouped by
+    reason. pub_mounts = [(mount, warns)], feeder_mounts = [(mount, idle)]."""
+    lines = ["", "──────────── RTSP streams ready ────────────",
+             "  port {}  transport {}".format(port, transport)]
+    if pub_mounts:
+        lines.append("")
+        lines += _url_rows(base, [m for m, _ in pub_mounts], mini_folders)
+    if feeder_mounts:
+        idles = {idle for _, idle in feeder_mounts}
+        what = ("black" if idles == {"black"} else
+                "frozen frame" if idles == {"frame"} else "black / frozen frame")
+        lines += ["", "  probe — {} until fired, then plays once".format(what)]
+        lines += _url_rows(base, [m for m, _ in feeder_mounts], mini_folders)
+        lines += ["  fire one   touch workspace/{}_<folder>_<name>".format(SIGNAL_FILE),
+                  "  fire all   touch workspace/{}".format(SIGNAL_FILE)]
+    if any(w for _, w in pub_mounts):
+        lines += ["", "  served as-is — clients joining mid-stream may glitch briefly",
+                  "  (camera_grade = true re-encodes them):"]
+        for key, label in WARN_TEXT.items():
+            names = [m[1:] for m, w in pub_mounts if key in w]
+            if names:
+                lines += textwrap.wrap(
+                    "  ".join(names), BANNER_W,
+                    initial_indent="    {:<11}".format(label),
+                    subsequent_indent=" " * 15, break_on_hyphens=False)
+    if man_folders:
+        lines += ["", "  index maps: " + ", ".join(
+            "workspace/{}/{}".format(f, MANIFEST_NAME) for f in man_folders)]
+    lines.append("─" * 45)
+    return lines
 
 
 def get_local_ip():
@@ -1290,7 +1479,7 @@ def main():
     _rm(os.path.join(workspace, PORT_FILE))
 
     say("══════════════════════════════════════")
-    say("  RTSP Streamer v{}".format(VERSION))
+    say("  RTSP Streamer")
     say("══════════════════════════════════════")
 
     # -- prepare: decide per video whether to stream the source directly or a
@@ -1310,7 +1499,7 @@ def main():
             loader = None
         if loader is not None and sys.stdout.isatty():
             try:
-                anim = loader.start(subtitle="v{}".format(VERSION))
+                anim = loader.start()
             except Exception:
                 anim = None
 
@@ -1385,8 +1574,8 @@ def main():
     # ffmpeg subprocesses, so a small thread pool cuts first-run startup on
     # multi-video sets (cached runs are quick either way). ex.map keeps the
     # results in source order, so mounts come out deterministic.
-    publishers = []     # (mount, file, warns)
-    probe_feeders = []  # (mount, content_file, w, h, fps)
+    publishers = []     # (mount, file, warns, fallback)
+    probe_feeders = []  # (mount, content_file, w, h, fps, idle)
     done = [0]
     done_lock = threading.Lock()
 
@@ -1499,13 +1688,18 @@ def main():
 
     # mount -> argv; "publish" loops a TS, "feeder" runs probe_feeder.py
     stream_cmds = {}
-    pub_mounts, feeder_mounts = [], []   # (mount, warns) / (mount, own signal)
-    for mount, fpath, warns in publishers:
+    pub_mounts, feeder_mounts = [], []   # (mount, warns) / (mount, idle)
+    # direct-served originals: mount -> (src, ts_path, setts, warns), the
+    # TS fallback built if its publisher dies (see materialize_ts)
+    fallbacks = {}
+    for mount, fpath, warns, fallback in publishers:
         mount = unique_mount(mount)
         url = "rtsp://127.0.0.1:{}{}".format(port, mount)
         stream_cmds[mount] = publish_cmd(fpath, url)
         pub_mounts.append((mount, warns))
-    for mount, fpath, w, h, fps in probe_feeders:
+        if fallback:
+            fallbacks[mount] = fallback
+    for mount, fpath, w, h, fps, idle in probe_feeders:
         mount = unique_mount(mount)
         url = "rtsp://127.0.0.1:{}{}".format(port, mount)
         # per-stream signal alongside the global one: touch workspace/start
@@ -1514,8 +1708,8 @@ def main():
         own_sig = "{}_{}".format(SIGNAL_FILE, mount[1:].replace("/", "_"))
         stream_cmds[mount] = feeder_cmd(
             fpath, url, w, h, fps,
-            [signal_path, os.path.join(workspace, own_sig)])
-        feeder_mounts.append((mount, own_sig))
+            [signal_path, os.path.join(workspace, own_sig)], idle)
+        feeder_mounts.append((mount, idle))
 
     procs = {}  # mount -> {proc, backoff, started, retry_at, bytes, bytes_ts}
     for mount, cmd in stream_cmds.items():
@@ -1538,64 +1732,28 @@ def main():
             log("not publishing after {:.0f}s (will keep retrying): {}".format(
                 READY_WAIT_SECONDS, ", ".join(sorted(pending))))
 
-    # short (!) markers on as-is streams (camera_grade=false), one legend
-    # line at the bottom — visible where the URL gets copied, no log flood
-    warn_text = {"bframes": "B-frames", "gop": "long GOP"}
-
-    # numbered mini mounts collapse in the banner: dozens of URLs that
-    # differ only by index would flood the screen, so the first and last
-    # are printed with a count between them (a (!) middle still gets its
-    # own line so no warning is hidden) — manifest.txt keeps the full map
-    display = []                 # ("url", mount, warns) | ("run", folder)
-    runs = {}                    # folder -> [(mount, warns)] in index order
-    for mount, warns in pub_mounts:
-        m = re.match(r"^/(.+)/\d+$", mount)
-        if m and m.group(1) in mini_index:
-            if m.group(1) not in runs:
-                display.append(("run", m.group(1)))
-            runs.setdefault(m.group(1), []).append((mount, warns))
-        else:
-            display.append(("url", mount, warns))
-
-    any_warn = any(w for _, w in pub_mounts)
-
-    def url_row(mount, warns):
-        mark = ("  (! {})".format(", ".join(warn_text.get(w, w) for w in warns))
-                if warns else "")
-        say("  rtsp://{}:{}{}{}".format(advertise, port, mount, mark))
-
-    say("")
-    say("──────────── RTSP streams ready ────────────")
-    say("  port {}  transport {}".format(port, transport))
-    for entry in display:
-        if entry[0] == "url":
-            url_row(entry[1], entry[2])
-            continue
-        entries = runs[entry[1]]
-        if len(entries) <= 3:
-            for mount, warns in entries:
-                url_row(mount, warns)
-            continue
-        mids = entries[1:-1]
-        url_row(*entries[0])
-        say("   ⋮  {} … {}  ({} more)".format(
-            mids[0][0], mids[-1][0], len(mids)))
-        for mount, warns in mids:
-            if warns:
-                url_row(mount, warns)
-        url_row(*entries[-1])
-    for mount, own_sig in feeder_mounts:
-        say("  rtsp://{}:{}{}  (probe — fire: touch workspace/{} | all: touch workspace/{})".format(
-            advertise, port, mount, own_sig, SIGNAL_FILE))
-    if any_warn:
-        say("  (!) served as-is — clients joining mid-stream may glitch briefly")
-    man_folders = sorted(set(mini_index) | set(concat_folders))
-    if man_folders:
-        say("  index maps: " + ", ".join(
-            "workspace/{}/{}".format(f, MANIFEST_NAME) for f in man_folders))
-    say("─────────────────────────────────────────────")
+    for line in banner_lines(
+            "rtsp://{}:{}".format(advertise, port), port, transport,
+            pub_mounts, feeder_mounts, set(mini_index),
+            sorted(set(mini_index) | set(concat_folders))):
+        say(line)
 
     last_watch = 0.0
+    fb_building = {}     # ts_path -> {"ok": None|bool}: TS fallback builds in flight
+
+    def start_fallback(fb):
+        job = {"ok": None}
+        fb_building[fb[1]] = job
+
+        def build():
+            try:
+                job["ok"] = materialize_ts(*fb)
+            except Exception:
+                log("TS fallback FAILED for {}: {}".format(
+                    fb[0], traceback.format_exc().strip()))
+                job["ok"] = False
+        threading.Thread(target=build, daemon=True).start()
+
     try:
         while not stopping:
             time.sleep(1.0)
@@ -1627,13 +1785,35 @@ def main():
                                 mount, now - st["bytes_ts"]))
                             p.kill()   # kill, not terminate: a wedged process may ignore TERM
 
+            # finished TS fallback builds: repoint every mount served from
+            # that original (running copies switch on their next restart)
+            for ts_path, job in list(fb_building.items()):
+                if job["ok"] is None:
+                    continue
+                del fb_building[ts_path]
+                for m in [m for m, fb in fallbacks.items() if fb[1] == ts_path]:
+                    del fallbacks[m]
+                    if job["ok"]:
+                        stream_cmds[m] = publish_cmd(
+                            ts_path, "rtsp://127.0.0.1:{}{}".format(port, m))
+                    if procs[m]["proc"] is None:
+                        procs[m]["retry_at"] = now
+
             for mount, st in procs.items():
                 if st["proc"] is not None and st["proc"].poll() is None:
                     if now - st["started"] > STABLE_RESET_SECONDS:
                         st["backoff"] = RESTART_BACKOFF_START
                     continue
                 # stream process died
-                if st["proc"] is not None:
+                if st["proc"] is not None and mount in fallbacks:
+                    # an original served directly died: hold restarts until
+                    # its TS copy is built, then serve that (materialize_ts)
+                    log("stream {} exited (rc={}), switching to a TS copy".format(
+                        mount, st["proc"].returncode))
+                    st["proc"], st["retry_at"] = None, float("inf")
+                    if fallbacks[mount][1] not in fb_building:
+                        start_fallback(fallbacks[mount])
+                elif st["proc"] is not None:
                     log("stream {} exited (rc={}), restarting in {:.0f}s".format(
                         mount, st["proc"].returncode, st["backoff"]))
                     st["retry_at"] = now + st["backoff"]
