@@ -311,6 +311,9 @@ Deep-dive documentation of every internal mechanism lives in
 | `latest` | the current release |
 | `X.Y.Z` (e.g. `2.10.0`) | pinned release versions |
 
+Images are published by CI: pushing a `vX.Y.Z` tag runs the tests and the
+docker smoke test, and only if both pass pushes `X.Y.Z` + `latest`.
+
 `latest` is not re-pulled automatically — after a release run
 `docker compose pull` (or `docker pull mikayelbag/rtsp-streamer:latest`).
 
