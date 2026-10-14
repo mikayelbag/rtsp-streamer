@@ -359,6 +359,66 @@ class TestBanner(unittest.TestCase):
         self.assertTrue(all(len(l) <= streamer.BANNER_W for l in warn))
 
 
+class TestBrokenChain(unittest.TestCase):
+    """_broken_chain() on canned trace_headers output (no ffmpeg)."""
+
+    @staticmethod
+    def trace(pics, gaps_ok=1, log2_fn=12):
+        """pics = [(nal_type, ref_idc, frame_num)] -> trace_headers lines."""
+        pre = "[trace_headers @ 0x1] "
+        out = [pre + "33          log2_max_frame_num_minus4      0001101 = {}".format(log2_fn),
+               pre + "51          gaps_in_frame_num_allowed_flag       1 = {}".format(gaps_ok)]
+        for nal, ref, fn in pics:
+            out += [pre + "1           nal_ref_idc                         11 = {}".format(ref),
+                    pre + "3           nal_unit_type                    00101 = {}".format(nal),
+                    pre + "8           first_mb_in_slice                    1 = 0",
+                    pre + "17          frame_num                       0001 = {}".format(fn)]
+        return [l + "\n" for l in out]
+
+    def run_on(self, lines):
+        class FakeProc:
+            def __init__(self, *a, **kw):
+                self.stderr = iter(lines)
+            def kill(self):
+                pass
+            def wait(self):
+                return 0
+        real = streamer.subprocess.Popen
+        streamer.subprocess.Popen = FakeProc
+        try:
+            return streamer._broken_chain("x.mp4")
+        finally:
+            streamer.subprocess.Popen = real
+
+    @staticmethod
+    def gop(n=6):
+        """IDR + ref/non-ref pairs, the camera pattern (frame_num every 2)."""
+        pics = [(5, 3, 0)]
+        for i in range(1, n):
+            pics.append((1, 2 if i % 2 else 0, (i + 1) // 2))
+        return pics
+
+    def test_clean_stream(self):
+        self.assertIsNone(self.run_on(self.trace(self.gop() + self.gop())))
+
+    def test_lost_idr_detected(self):
+        pics = self.gop(8) + self.gop(8)[1:]       # second IDR dropped
+        why = self.run_on(self.trace(pics))
+        self.assertIn("lost IDR", why)
+
+    def test_must_start_on_idr(self):
+        self.assertIn("IDR", self.run_on(self.trace(self.gop()[1:])))
+
+    def test_small_gap_ok_when_allowed(self):
+        pics = [(5, 3, 0), (1, 2, 1), (1, 2, 4), (1, 2, 5)]
+        self.assertIsNone(self.run_on(self.trace(pics, gaps_ok=1)))
+        self.assertIsNotNone(self.run_on(self.trace(pics, gaps_ok=0)))
+
+    def test_frame_num_wrap_ok(self):
+        pics = [(5, 3, 0)] + [(1, 2, i % 16) for i in range(1, 40)]
+        self.assertIsNone(self.run_on(self.trace(pics, log2_fn=0)))
+
+
 class TestNeedsTranscode(unittest.TestCase):
     def setts(self, **kw):
         s = {"force_reencode": False, "fps": "keep", "size": "keep",

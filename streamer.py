@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RTSP streamer 2.10.0
+RTSP streamer 2.10.1
 
 Serves every video found under the videos folder as a looping live RTSP
 stream. For each stream this is the equivalent of:
@@ -79,7 +79,7 @@ import traceback
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "2.10.0"
+VERSION = "2.10.1"
 SIGNAL_FILE = "start"       # touch workspace/start to fire armed probe streams
 PORT_FILE = ".port"         # bound RTSP port, written for the Docker healthcheck
 X264_PRESET = "veryfast"
@@ -357,6 +357,15 @@ def needs_transcode(path, setts, info):
     elif info[0] not in ALLOWED_CODECS:
         reasons.append("codec={}".format(info[0]))
     else:
+        # a broken reference chain re-encodes regardless of camera_grade —
+        # it isn't a realism nuance, it derails hardware decoders (see
+        # _broken_chain); only checked when nothing else forces an encode
+        if not reasons and info[0] == "h264":
+            broken = _broken_chain(path)
+            if broken:
+                log("broken source ({}), re-encoding: {}".format(broken, path))
+                reasons.append("broken")
+                return reasons, warns
         # realism checks only when nothing above already forces an encode
         # (the GOP scan reads the whole packet index)
         realism = []
@@ -369,6 +378,80 @@ def needs_transcode(path, setts, info):
         else:
             warns = realism
     return reasons, warns
+
+
+FRAME_NUM_GAP_OK = 16    # gaps_in_frame_num_allowed: max legit forward skip
+
+
+def _broken_chain(path):
+    """Why an H.264 source can't be stream-copied safely, or None.
+
+    Reads slice headers only (trace_headers, no decode — ~0.5 s per minute
+    of 1080p). Two defects, both found in real camera recordings:
+
+    - a lost IDR: the following P-frames' frame_num continues from the
+      vanished IDR (e.g. 15 -> 1) and their POC drops without the reset an
+      IDR brings. FFmpeg reads that as reordering, grows its reorder buffer
+      ("Increasing reorder buffer to 13") and from then on holds that many
+      frames — NVDEC's level-sized surface pool runs dry: "No decoder
+      surfaces left", then "Missing reference picture". The software
+      decoder conceals it silently, so decoder logs can't catch it.
+    - the file doesn't open on an IDR, so every -stream_loop wrap lands
+      mid-chain the same way.
+
+    Rule (H.264 7.4.3): a non-IDR picture's frame_num equals the previous
+    reference picture's, or that plus one. With gaps_in_frame_num_allowed
+    a small forward skip is legal (dropped frames); anything else is not.
+    Re-encoding conceals the hole once and emits a clean chain. Any
+    failure to scan reports None — unknown is not known-bad."""
+    try:
+        p = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-nostdin", "-i", path, "-map", "0:v:0",
+             "-c", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, errors="replace")
+    except OSError:
+        return None
+    max_fn, gaps_ok = 1 << 16, False
+    ref_idc = nal = None
+    prev_ref, first, why = None, True, None
+    try:
+        for line in p.stderr:
+            m = re.search(r"\]\s+\d+\s+(\w+)\s+\S+ = (\d+)$", line)
+            if not m:
+                continue
+            key, val = m.group(1), int(m.group(2))
+            if key == "log2_max_frame_num_minus4":
+                max_fn = 1 << (val + 4)
+            elif key == "gaps_in_frame_num_allowed_flag":
+                gaps_ok = bool(val)
+            elif key == "nal_ref_idc":
+                ref_idc = val
+            elif key == "nal_unit_type":
+                nal = val
+            elif key == "first_mb_in_slice":
+                nal = nal if val == 0 else None    # one check per picture
+            elif key == "frame_num" and nal in (1, 5):
+                if first:
+                    first = False
+                    if nal != 5:
+                        why = "does not start on an IDR"
+                        break
+                if nal == 1 and prev_ref is not None and val not in (
+                        prev_ref, (prev_ref + 1) % max_fn):
+                    gap = (val - prev_ref) % max_fn
+                    if not (gaps_ok and gap <= FRAME_NUM_GAP_OK):
+                        why = "lost IDR: frame_num {} -> {}".format(prev_ref, val)
+                        break
+                if nal == 5:
+                    prev_ref = 0
+                elif ref_idc:
+                    prev_ref = val
+                nal = None
+    finally:
+        p.kill()
+        p.wait()
+    return why
 
 
 def _gop_too_long(path, fps):
@@ -731,6 +814,9 @@ def remux_to_ts(src, dst):
 # timestamps for a -c copy publish).
 DIRECT_EXTS = (".mp4", ".m4v", ".mov", ".mkv", ".ts")
 DIRECT_SUFFIX = ".direct"
+SOURCE_CHECKS = 2       # bump when source analysis gains a check: cached
+                        # direct decisions from older checks are redone
+                        # (2 = _broken_chain, added in 2.10.1)
 
 
 def _src_sig(src):
@@ -739,7 +825,8 @@ def _src_sig(src):
 
 
 def _write_direct(ts_path, src, warns):
-    meta = {"version": VERSION, "keyint": KEYINT, "src": src}
+    meta = {"version": VERSION, "keyint": KEYINT, "src": src,
+            "checks": SOURCE_CHECKS}
     meta.update(_src_sig(src))
     if warns:
         meta["warn"] = warns
@@ -753,8 +840,9 @@ def _write_direct(ts_path, src, warns):
 def _direct_cached(ts_path, src, setts):
     """The cached direct-serving decision for src: its as-is warnings ([]
     when clean), or None when there is no valid decision (no sidecar, source
-    replaced or touched, keyint changed — the GOP verdict depends on it — or
-    camera_grade now forbids the as-is issues it recorded)."""
+    replaced or touched, keyint changed (the GOP verdict depends on it),
+    made by an older set of source checks, or camera_grade now forbids the
+    as-is issues it recorded)."""
     try:
         with open(ts_path + DIRECT_SUFFIX, encoding="utf-8") as f:
             meta = json.load(f)
@@ -763,6 +851,7 @@ def _direct_cached(ts_path, src, setts):
         return None
     if (setts["force_reencode"] or meta.get("src") != src
             or meta.get("keyint") != KEYINT
+            or meta.get("checks") != SOURCE_CHECKS
             or any(meta.get(k) != v for k, v in sig.items())):
         return None
     warns = meta.get("warn") or []

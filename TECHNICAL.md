@@ -6,7 +6,7 @@ written so that a junior engineer with no video-streaming background can
 follow along. The user-facing overview (quick start, config reference) lives
 in [`README.md`](README.md); this file is the "why and how" companion.
 
-Version covered: **2.10.0**.
+Version covered: **2.10.1**.
 
 ---
 
@@ -276,6 +276,7 @@ force_reencode = true        → transcode ("forced")
 fps / size / bitrate ≠ keep  → transcode (the change requires re-encoding)
 ffprobe can't read it        → transcode ("unreadable")
 codec not h264/hevc          → transcode (not RTSP-friendly as-is)
+broken reference chain       → transcode ("broken", always — see below)
 source has B-frames          → transcode ("bframes") with camera_grade=true,
                                else as-is + warning (camera realism, below)
 keyframes > 2×KEYINT apart   → transcode ("gop") with camera_grade=true,
@@ -286,6 +287,25 @@ otherwise                    → direct (or remux: -c copy, lossless, fast)
 If even the remux fails (some AVIs carry no usable timestamps — ffmpeg says
 `first pts and dts value must be set`), it falls back to a transcode, which
 synthesizes fresh timestamps. A quirky source still serves.
+
+**Broken sources (2.10.1).** Camera recordings can lose frames, and when
+the lost frame is an IDR the file carries a chain of P-frames that
+references a picture that doesn't exist: `frame_num` continues from the
+vanished IDR (15 → 1) and the POC drops without the reset an IDR brings.
+Software decoders conceal this silently, but a reader's FFmpeg reads the
+POC drop as reordering ("Increasing reorder buffer to 13") and from then on
+holds that many frames, which runs NVDEC's level-sized surface pool dry:
+`No decoder surfaces left`, then `Missing reference picture`. The stream
+plays fine until the playhead reaches the damage, then breaks on every
+loop. `_broken_chain()` finds it by parsing slice headers only
+(`trace_headers`, no decode, ~0.5 s per minute of 1080p): a non-IDR
+picture's `frame_num` must equal the previous reference picture's or that
+plus one (small forward skips are allowed when the SPS sets
+`gaps_in_frame_num_allowed_flag`), and the file must open on an IDR, or
+every loop wrap lands mid-chain. A hit is a re-encode reason regardless of
+`camera_grade`: the encoder conceals the hole once and emits a clean
+chain. Cached direct-serving decisions record `SOURCE_CHECKS`, so ones
+made before this check existed are redone once.
 
 **Camera realism.** The point of the whole tool is to stand in for real IP
 cameras, and real cameras encode very specifically: **no B-frames** and an
@@ -813,6 +833,7 @@ Design notes that matter to a reader:
 | First run very slow | transcodes (codec not h264/hevc, or fps/size/bitrate set) — subsequent runs hit the cache | `streamer.log` `transcoding [reasons]` lines |
 | Changed config, nothing rebuilt | artifacts are cached by setting-tagged names, mtime and the `.meta` build stamp; `fps/size/bitrate` changes rename the artifact and `keyint` changes invalidate the stamp — both rebuild automatically | `force_reencode = true` once, or delete `workspace/` |
 | Engine logs `No decoder surfaces left`, then `Missing reference picture` / `decode_slice_header error` / `cuvidDecodePicture … CUDA_ERROR_INVALID_VALUE` (NVDEC) | pre-2.10.0 encodes declare 1 reference frame + no reorder → a 3-surface NVDEC pool; 2.10.0 encodes with `ref=4` and rebuilds old artifacts on its first start. On an **as-is** stream (listed under "served as-is") the SPS is the source's own — set `camera_grade = true` or `force_reencode = true` for it | §7.2 |
+| Engine works for a while, then `Increasing reorder buffer to N` → `No decoder surfaces left` → `Missing reference picture`, repeating once per loop | the source file lost an IDR (damaged recording); 2.10.1 detects it and re-encodes (`streamer.log`: `broken source (lost IDR: …)`) | §7.2 "Broken sources" |
 | Banner/logs show an older version than expected | compose never re-pulls `latest` on its own; the local image is stale | `docker compose pull && docker compose up -d` |
 | Corrupt-looking loop on shifted copies | an old pre-2.3.1 truncated cache file | delete `workspace/` |
 | Engine logs `reference picture missing during reorder` / `mmco: unref short failure` | B-frames reached the reader: pre-2.3.2 cached files (auto-rebuilt on the next 2.3.2 start) or a pre-2.3.2 image. A short burst (<2 s) right at connect on older versions was the mid-GOP join; 2.3.2's camera-grade encode bounds it to a silent ≤2 s wait | §7.2; rerun so the cache migrates |

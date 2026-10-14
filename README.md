@@ -272,6 +272,11 @@ already make a restarted recorder resume its playlist correctly.
   on first run — and the banner lists them under "served as-is", grouped by
   reason, since mid-stream joins may glitch. Flipping the setting rebuilds
   the affected streams automatically.
+- **Damaged recordings repaired** — a source that lost a keyframe (common in
+  camera recordings) would break hardware decoders every time the loop
+  reaches the damage (`No decoder surfaces left`, `Missing reference
+  picture`). Such files are detected on the first run and re-encoded into a
+  clean stream.
 - **Crash-safe cache** — prepared files are written to a temp name and renamed
   into place atomically, so a container killed mid-transcode never leaves a
   truncated file that would be served on the next run.
@@ -309,7 +314,7 @@ Deep-dive documentation of every internal mechanism lives in
 | Tag | What |
 |---|---|
 | `latest` | the current release |
-| `X.Y.Z` (e.g. `2.10.0`) | pinned release versions |
+| `X.Y.Z` (e.g. `2.10.1`) | pinned release versions |
 
 Images are published by CI: pushing a `vX.Y.Z` tag runs the tests and the
 docker smoke test, and only if both pass pushes `X.Y.Z` + `latest`.
