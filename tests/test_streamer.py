@@ -4,6 +4,7 @@ Run:  python3 -m unittest discover -s tests -v
 """
 
 import configparser
+import io
 import json
 import os
 import sys
@@ -308,55 +309,231 @@ class TestDirect(unittest.TestCase):
 
 class TestBanner(unittest.TestCase):
     BASE = "rtsp://10.0.0.1:41000"
+    U = "    rtsp://10.0.0.1:41000"          # a URL line: 4-space indent
 
-    def lines(self, pubs=(), feeders=(), minis=(), mans=()):
+    def lines(self, pubs=(), feeders=(), minis=(), mans=(), color=False,
+              log_hint=None):
         return streamer.banner_lines(self.BASE, 41000, "tcp", list(pubs),
-                                     list(feeders), set(minis), list(mans))
+                                     list(feeders), set(minis), list(mans),
+                                     color=color, log_hint=log_hint)
+
+    def test_header_counts_streams(self):
+        out = self.lines(pubs=[("/a/x", []), ("/b/y", [])],
+                         feeders=[("/p/z", "black")])
+        self.assertIn("✔ 3 streams live  ·  port 41000  ·  tcp", out)
+
+    def test_grouped_by_folder(self):
+        out = self.lines(pubs=[("/a/x", []), ("/b/y", []), ("/a/z", [])])
+        a, b = out.index("  a"), out.index("  b")
+        self.assertLess(a, b)
+        self.assertEqual(out[a + 1:a + 3], [self.U + "/a/x", self.U + "/a/z"])
+        self.assertEqual(out[b + 1], self.U + "/b/y")
 
     def test_url_lines_are_bare(self):
         out = self.lines(pubs=[("/a/x", ["bframes"]), ("/a/y", [])])
-        self.assertIn("  rtsp://10.0.0.1:41000/a/x", out)
-        self.assertIn("  rtsp://10.0.0.1:41000/a/y", out)
+        self.assertIn(self.U + "/a/x", out)
+        self.assertIn(self.U + "/a/y", out)
 
-    def test_warnings_grouped_by_reason(self):
-        out = self.lines(pubs=[("/a/x", ["bframes"]), ("/a/y", ["gop"]),
+    def test_warning_under_its_url(self):
+        out = self.lines(pubs=[("/a/x", ["bframes"]), ("/a/y", []),
                                ("/a/z", ["bframes", "gop"])])
-        bf = [l for l in out if l.strip().startswith("B-frames")]
-        gop = [l for l in out if l.strip().startswith("long GOP")]
-        self.assertEqual(len(bf), 1)
-        self.assertIn("a/x", bf[0])
-        self.assertIn("a/z", bf[0])
-        self.assertIn("a/y", gop[0])
-        self.assertNotIn("a/x", gop[0])
+        x = out.index(self.U + "/a/x")
+        self.assertEqual(out[x + 1], "      ↳ served as-is: B-frames")
+        y = out.index(self.U + "/a/y")
+        self.assertNotIn("↳", out[y + 1])
+        z = out.index(self.U + "/a/z")
+        self.assertEqual(out[z + 1], "      ↳ served as-is: B-frames, long GOP")
+        self.assertTrue(any("camera_grade = true" in l for l in out))
 
-    def test_no_warning_block_when_clean(self):
+    def test_color_paints_only_glyphs_and_warned(self):
+        out = self.lines(pubs=[("/a/x", ["gop"]), ("/a/y", [])], color=True)
+        red = streamer.RED + self.BASE + "/a/x" + streamer.RESET
+        self.assertIn("    " + red, out)
+        self.assertIn(self.U + "/a/y", out)
+        self.assertTrue(any(l.startswith(streamer.DIM + "      ↳") for l in out))
+        self.assertTrue(out[1].startswith(streamer.GREEN + "✔" + streamer.RESET))
+
+    def test_no_color_no_escapes(self):
+        out = self.lines(pubs=[("/a/x", ["bframes"])], feeders=[("/p/q", "black")],
+                         mans=["mini"], log_hint="workspace/streamer.log")
+        self.assertFalse(any("\033" in l for l in out))
+
+    def test_no_as_is_hint_when_clean(self):
         out = self.lines(pubs=[("/a/x", [])])
-        self.assertFalse(any("as-is" in l for l in out))
+        self.assertFalse(any("↳" in l for l in out))
 
-    def test_probe_fire_instructions_once(self):
+    def test_footer_labels(self):
+        out = self.lines(pubs=[("/mini/1", [])], minis={"mini"},
+                         mans=["mini", "chain"], log_hint="workspace/streamer.log")
+        self.assertIn("  maps  workspace/mini/manifest.txt", out)
+        self.assertIn("        workspace/chain/manifest.txt", out)
+        self.assertIn("  logs  workspace/streamer.log", out)
+        self.assertEqual(out[-1], "  stop  Ctrl-C")
+
+    def test_probe_folder_fire_commands(self):
         out = self.lines(feeders=[("/p/a", "black"), ("/p/b", "black")])
-        self.assertEqual(sum("touch workspace" in l for l in out), 2)
-        self.assertIn("  rtsp://10.0.0.1:41000/p/a", out)
-        self.assertTrue(any("black until fired" in l for l in out))
+        self.assertIn("  p  black until fired, then plays once", out)
+        self.assertIn(self.U + "/p/a", out)
+        self.assertIn("    fire one  touch workspace/start_p_<name>", out)
+        self.assertIn("  fire  touch workspace/start  (all probes)", out)
 
-    def test_probe_frame_idle_heading(self):
-        out = self.lines(feeders=[("/p/a", "frame")])
-        self.assertTrue(any("frozen frame until fired" in l for l in out))
+    def test_single_probe_fire_names_it(self):
+        out = self.lines(feeders=[("/p/door", "frame")])
+        self.assertIn("    fire one  touch workspace/start_p_door", out)
+        self.assertIn("  p  frozen frame until fired, then plays once", out)
 
     def test_mini_run_collapses(self):
         out = self.lines(pubs=[("/mini/{}".format(i), []) for i in range(1, 11)],
                          minis={"mini"})
-        self.assertIn("  rtsp://10.0.0.1:41000/mini/1", out)
-        self.assertIn("  rtsp://10.0.0.1:41000/mini/10", out)
-        self.assertTrue(any("(8 more)" in l for l in out))
-        self.assertNotIn("  rtsp://10.0.0.1:41000/mini/5", out)
+        self.assertIn("  mini  10 clips", out)
+        self.assertIn(self.U + "/mini/1", out)
+        self.assertIn(self.U + "/mini/10", out)
+        self.assertIn("    ⋮  mini/2 … mini/9  (8 more)", out)
+        self.assertNotIn(self.U + "/mini/5", out)
+
+    def test_warned_mini_run_not_collapsed(self):
+        pubs = [("/mini/{}".format(i), []) for i in range(1, 11)]
+        pubs[4] = ("/mini/5", ["bframes"])
+        out = self.lines(pubs=pubs, minis={"mini"})
+        self.assertIn(self.U + "/mini/5", out)
+        self.assertFalse(any("more)" in l for l in out))
 
     def test_lines_fit_pty(self):
-        names = [("/folder/clip_{:03d}".format(i), ["bframes"]) for i in range(40)]
-        out = self.lines(pubs=names)
-        warn = [l for l in out if l.startswith("    ") or l.startswith(" " * 15)]
-        self.assertTrue(warn)
-        self.assertTrue(all(len(l) <= streamer.BANNER_W for l in warn))
+        names = [("/folder/clip_{:03d}".format(i), ["bframes", "gop"]) for i in range(40)]
+        out = self.lines(pubs=names, mans=["folder"], log_hint="workspace/streamer.log")
+        self.assertTrue(all(len(l) <= streamer.BANNER_W for l in out))
+
+
+class TestConsole(unittest.TestCase):
+    def make(self, live):
+        buf = io.StringIO()
+        return streamer.Console(live=live, color=False, out=buf), buf
+
+    def test_plain_events_append(self):
+        con, buf = self.make(live=False)
+        con.heartbeat(3, 3, 5)                 # no status line without a TTY
+        con.event("!", streamer.YELLOW, "a/x exited", "(rc=1) · restarting in 2s")
+        out = buf.getvalue()
+        self.assertNotIn("publishing", out)
+        self.assertRegex(out, r"^\d\d:\d\d:\d\d  ! a/x exited \(rc=1\) · restarting in 2s\n$")
+
+    def test_status_pinned_below_events(self):
+        con, buf = self.make(live=True)
+        con.heartbeat(2, 3, 30)
+        con.heartbeat(2, 3, 30)                # unchanged: no redraw
+        con.event("✔", streamer.GREEN, "a/x back up")
+        out = buf.getvalue()
+        self.assertEqual(out.count("2/3 publishing"), 2)   # drawn, then redrawn under the event
+        tail = out.split("a/x back up")[1]
+        self.assertIn("● 2/3 publishing  ·  up 30s\n", tail)
+        # redraws climb one line and never write left of column 18
+        self.assertIn(streamer.UP + streamer.GO_COL + streamer.EL, out)
+        self.assertNotIn("\r", out)
+
+    def test_final_event_replaces_status(self):
+        con, buf = self.make(live=True)
+        con.heartbeat(1, 1, 5)
+        con.event("✖", streamer.RED, "mediamtx died", final=True)
+        self.assertTrue(buf.getvalue().endswith("mediamtx died\n"))
+        self.assertIsNone(con.status)
+
+    def test_stop_sequence(self):
+        con, buf = self.make(live=True)
+        con.heartbeat(4, 4, 10)
+        con.stopping(4)
+        con.stopped(4700, 0.8)
+        out = buf.getvalue()
+        self.assertIn("Stopping 4 streams", out)
+        self.assertTrue(out.endswith("✔ rtsp-streamer Stopped · up 1h18m · 0.8s\n"))
+
+    def test_uptime_text(self):
+        self.assertEqual(streamer.uptime_text(42), "42s")
+        self.assertEqual(streamer.uptime_text(18 * 60 + 5), "18m")
+        self.assertEqual(streamer.uptime_text(78 * 60), "1h18m")
+
+
+class TestProgressReports(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+        test = self
+
+        class Rec:
+            def item_progress(self, name, f):
+                test.calls.append(("progress", name, round(f, 3)))
+
+            def item_step(self, name, label, detail=""):
+                test.calls.append(("step", name, label, detail))
+
+            def item_note(self, name, kind, detail=""):
+                test.calls.append(("note", name, kind, detail))
+
+        streamer.REPORTER = Rec()
+        streamer._TASK.name, streamer._TASK.span = "knife/k", (0.0, 1.0)
+
+    def tearDown(self):
+        streamer.REPORTER = None
+        streamer._TASK.name = None
+
+    def test_reason_text(self):
+        self.assertEqual(streamer._reason_text(["broken"]), "broken chain")
+        self.assertEqual(streamer._reason_text(["fps", "size", "codec=mpeg4"]),
+                         "settings, codec mpeg4")
+
+    def test_no_reporter_no_calls(self):
+        streamer.REPORTER = None
+        streamer._report_step("Checking")      # must be a silent no-op
+
+    def test_step_and_note_reach_reporter(self):
+        streamer._report_step("Re-encoding", "broken chain")
+        streamer._report_note("reencoded", "broken chain")
+        self.assertEqual(self.calls, [("step", "knife/k", "Re-encoding", "broken chain"),
+                                      ("note", "knife/k", "reencoded", "broken chain")])
+
+    def test_ffmpeg_progress_is_out_time_over_duration(self):
+        """A 30 min output 15 min in reports 0.5 (ffmpeg -progress lines)."""
+        lines = ["frame=10\n", "out_time_us=900000000\n", "progress=continue\n",
+                 "out_time_us=N/A\n", "out_time_us=1800000000\n", "progress=end\n"]
+
+        class FakeProc:
+            def __init__(self, cmd, **kw):
+                FakeProc.cmd = cmd
+                self.stdout = iter(lines)
+                self.stderr = io.StringIO("")
+                self.returncode = 0
+
+            def wait(self):
+                return 0
+
+        old = streamer.subprocess.Popen
+        streamer.subprocess.Popen = FakeProc
+        try:
+            r = streamer._ffmpeg(["ffmpeg", "-i", "x", "out.ts"], out_dur=1800.0)
+        finally:
+            streamer.subprocess.Popen = old
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(FakeProc.cmd[:4], ["ffmpeg", "-progress", "pipe:1", "-nostats"])
+        self.assertEqual([c[2] for c in self.calls], [0.5, 1.0])
+
+    def test_span_maps_segment_progress(self):
+        streamer._TASK.span = (0.5, 0.25)      # segment 3 of 4
+        lines = ["out_time_us=5000000\n"]
+
+        class FakeProc:
+            def __init__(self, cmd, **kw):
+                self.stdout = iter(lines)
+                self.stderr = io.StringIO("")
+                self.returncode = 0
+
+            def wait(self):
+                return 0
+
+        old = streamer.subprocess.Popen
+        streamer.subprocess.Popen = FakeProc
+        try:
+            streamer._ffmpeg(["ffmpeg", "out.ts"], out_dur=10.0)
+        finally:
+            streamer.subprocess.Popen = old
+        self.assertEqual(self.calls, [("progress", "knife/k", 0.625)])
 
 
 class TestBrokenChain(unittest.TestCase):

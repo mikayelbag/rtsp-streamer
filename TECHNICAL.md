@@ -6,7 +6,7 @@ written so that a junior engineer with no video-streaming background can
 follow along. The user-facing overview (quick start, config reference) lives
 in [`README.md`](README.md); this file is the "why and how" companion.
 
-Version covered: **2.10.1**.
+Version covered: **2.11.0**.
 
 ---
 
@@ -227,8 +227,11 @@ interface would route there).
     until the mediamtx API reports every mount `ready` — i.e. its publisher
     has completed the RTSP handshake and is delivering. "Ready" in the output
     therefore means an engine pointed at the URLs connects on the first try.
-    Streams still pending at the timeout are logged and left to the
-    supervisor; the banner prints regardless.
+    Streams still pending at the timeout get one `!` event line under the
+    banner and are left to the supervisor; the banner prints regardless.
+    The banner groups URLs by folder (bold heading, URLs indented below)
+    and ends in a footer of dim labels: what as-is means (only when one is
+    listed), fire-all for probes, index maps, the log path, how to stop.
 11. **Supervision loop** entered (§12).
 
 ---
@@ -354,9 +357,9 @@ clean picture — no decode-error spam.
 **The default: `camera_grade = false` (since 2.5.0).** The realism checks
 (B-frames, long GOP) are *warnings*, not re-encode reasons: the source is
 served as-is (no CPU burn on first run), the warning is recorded in the
-build stamp / direct sidecar, and the URL banner lists the affected streams
-once, grouped by reason, below the URLs (`B-frames  a/x  b/y`,
-`long GOP  c/z`) — the URL lines themselves stay bare for copying. Setting
+build stamp / direct sidecar, and the URL banner paints each affected URL
+red with a dim `↳ served as-is: B-frames, long GOP` line right under it —
+the URL text itself stays bare for copying. Setting
 `camera_grade = true` rebuilds the listed streams automatically (the stamp
 remembers). Codec conversion is *not*
 affected by the setting: a non-h264/hevc source (e.g. MPEG-4 Part 2) always
@@ -629,8 +632,9 @@ The interesting keys:
 
 The main loop polls once per second:
 
-- **mediamtx died** → everything is unusable; log and shut down (in Docker,
-  `restart: unless-stopped` brings the whole container back).
+- **mediamtx died** → everything is unusable; log and shut down with exit
+  code 1 (in Docker, `restart: unless-stopped` brings the whole container
+  back).
 - **A stream process died** → schedule a restart with exponential backoff:
   2 s doubling to 30 s cap, reset to 2 s after a process survives 60 s
   (`RESTART_BACKOFF_START/MAX`, `STABLE_RESET_SECONDS`). Backoff prevents a
@@ -744,12 +748,14 @@ line, then **one fixed row per folder** that changes state in place —
 Waiting → Downloading → Pull complete:
 
 ```
-rtsp_streamer  | [prepare] processing 70 videos... (details: workspace/streamer.log)
+rtsp_streamer  | RTSP Streamer 2.11.0  ·  70 videos in 5 folders
 rtsp_streamer  |
-rtsp_streamer  | ⠸ rtsp-streamer [⣿⣶⡀] 23/70 Preparing             51.4s
-rtsp_streamer  |   ✔ ids Ready (3 videos)                          49.3s
-rtsp_streamer  |   ⠸ tfa 2/5 Preparing dalma_fhd                    9.4s
-rtsp_streamer  |   ⠸ mini 16/61 Preparing                          31.0s
+rtsp_streamer  | ⠸ rtsp-streamer [⣿⡀⣦⣀⠀] 21/70 Preparing                        51.4s
+rtsp_streamer  |   ✔ ids Ready (2 videos) · cached                             0.4s
+rtsp_streamer  |   ⠸ knife Re-encoding · broken chain                          9.4s
+rtsp_streamer  |   ⠸ tfa 3/5 Checking dalma_fhd                                6.2s
+rtsp_streamer  |   ⠸ mini 16/61 Preparing                                     31.0s
+rtsp_streamer  |   - probe Waiting
 ```
 
 Nothing is ever printed above the header, so it cannot sink as folders
@@ -765,7 +771,15 @@ Design notes that matter to a reader:
 
 - Runs on a daemon thread; `set_items()` / `item_start()` / `item_done()`
   are the API (all lock-protected) — streamer declares the ordered video
-  list once, then each prepare worker marks its item running/done. Videos
+  list once, then each prepare worker marks its item running/done. While
+  running, a worker also reports `item_step()` (what it is doing:
+  Checking, Re-encoding · why, Remuxing, Building mini, …),
+  `item_progress()` (0..1, see the bar below) and `item_note()` (the
+  outcome — cached / re-encoded: why / as-is — summed into the folder's
+  Ready row: `✔ knife Ready (1 video) · re-encoded: broken chain`). The
+  worker side lives in streamer.py: `run_job()` names the thread's video
+  in a thread-local, and `_report_*()` / `_ffmpeg()` forward to the loader
+  only while it animates (`REPORTER`), so builds stay display-agnostic. Videos
   sharing a folder share one row; a *group* key (the numbered mini mounts)
   makes the row count clips without naming the current one, and its final
   line reads `✔ mini Ready (61 clips)` — the per-index map lives in
@@ -781,17 +795,26 @@ Design notes that matter to a reader:
   the same columns are simply an empty margin.
 - **The header bar is docker pull's**, not a left-to-right meter: one
   braille cell per folder, and each folder's own cell **rises bottom-up**
-  (`⠀⡀⣀⣄⣤⣦⣶⣷⣿`, 8 dot-steps) with that folder's done/total —
+  (`⠀⡀⣀⣄⣤⣦⣶⣷⣿`, 8 dot-steps) with that folder's **real** progress —
   `[⣿⣶⡀]` reads folder 1 done, folder 2 ~70 %, folder 3 just started.
-  A cell crawls toward its real position (`CATCHUP_FRAC` of the gap per
-  frame) and while a slow video holds progress it creeps upward, capped at
-  `CREEP_CAP` (90 %) of the in-progress video's share — a cell never
-  claims work that isn't done. Monotonic per folder. (The empty track is
+  Real means finished videos plus the encoded fraction of those in
+  flight: every ffmpeg build step runs with `-progress pipe:1`, and
+  `out_time` over the output's duration is that video's fraction — a
+  30 min source 15 min into its re-encode fills half its share (a
+  multi-segment concat chain gives each segment 1/n). A cell crawls toward
+  that position (`CATCHUP_FRAC` of the gap per frame); only videos that
+  report nothing (stream-copies, checks) let it creep, capped at
+  `CREEP_CAP` (90 %) of their share — a cell never claims work that isn't
+  done. Monotonic per folder; a video's fraction stays below 1 until
+  `item_done()`, since one video may run several ffmpeg passes. (The empty track is
   the blank braille cell `⠀`, U+2800 — same width as `⣿`, so geometry
   never shifts.)
 - Rows follow the compose-pull rhythm: dim `-` Waiting, spinner + ticking
   elapsed while preparing (ungrouped rows also name the video currently
-  being worked on), green `✔` + frozen elapsed when ready. Elapsed is
+  being worked on, single-video rows say why it re-encodes), green `✔` +
+  frozen elapsed when ready. Colour sits on glyphs and cells only —
+  brackets, words and counts stay plain, the app name is bold, elapsed
+  times and notes are dim. Elapsed is
   right-aligned at the terminal edge; long names truncate with `…` so the
   column never breaks. Should folders ever outnumber the screen, trailing
   Waiting rows collapse into one `- N folders Waiting` row.
@@ -811,12 +834,29 @@ Design notes that matter to a reader:
 
 | | `MODE=prod` (default) | `MODE=dev` |
 |---|---|---|
-| stdout | banner, loader progress ticker, URL list | everything |
+| stdout | header line, loader block, URL banner, runtime events + status line | everything (events too; no status line) |
 | details (`log()`) | appended to `workspace/streamer.log`, timestamped | stdout |
 | child process output | `workspace/streamer.log` | stdout |
 | mediamtx log level | `error` | `warn` |
 
 `log()` is detail logging; `say()` is user-facing and always stdout.
+
+**Runtime console (`Console`).** After the banner, the supervisor reports
+what a user would want to see without opening the log, one timestamped
+line each — `HH:MM:SS  ! tfa/x exited (rc=1) · restarting in 2s`,
+`✔ tfa/x back up` (alive `RECOVERED_SECONDS` after a restart),
+`! … publisher exited · building TS copy`, `! … stalled · restarting`,
+`! … not publishing after 15s · retrying`, and the fatal
+`✖ mediamtx died (rc=…)`. On a live terminal one status line stays
+pinned under them, `● 70/70 publishing · up 18m`, redrawn in place with
+the loader's compose-safe technique (each line ends in `\n`, redraws
+climb one line and erase from column 18 only). A clean stop turns it
+into `⠼ rtsp-streamer Stopping N streams`, then
+`✔ rtsp-streamer Stopped · up 1h18m · 0.8s`. Without a terminal (piped,
+CI, `MODE=dev`) events are plain append-only lines and there is no
+status line. Colour follows the loader's rules — cyan working, green
+done, yellow attention, red broken, dim secondary — and is off when
+stdout isn't a terminal or `NO_COLOR` is set.
 
 ---
 

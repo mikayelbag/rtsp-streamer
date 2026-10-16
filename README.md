@@ -91,7 +91,7 @@ overrides. Key settings:
 | `shift_frames` | `0` | phase offset between copies — simulate out-of-phase cameras |
 | `fps` / `size` / `bitrate_kbps` | `keep` | re-encode targets (`keep` = stream as-is) |
 | `force_reencode` | `false` | always normalise to H.264, 2 s keyframes |
-| `camera_grade` | `false` | `true` = re-encode sources with B-frames / long GOP so streams behave exactly like real IP cameras; `false` (default) = serve them as-is — faster first run, listed under "served as-is" in the banner, mid-stream joins may glitch |
+| `camera_grade` | `false` | `true` = re-encode sources with B-frames / long GOP so streams behave exactly like real IP cameras; `false` (default) = serve them as-is — faster first run, URL shown in red in the banner with the reason underneath, mid-stream joins may glitch |
 | `probe` | `false` | black until a signal, then play once (see below) |
 | `probe_idle` | `black` | probe idle picture: `black`, or `frame` = first frame frozen until fired, last frame frozen after each pass |
 | `mini` | `false` | short-clip 1-minute loop: frozen first frame 10 s + clip + black; streams mount as numbers `/mini/1…N` (see below) |
@@ -114,7 +114,7 @@ overrides. Key settings:
 
 | Var | Default | Meaning |
 |---|---|---|
-| `MODE` | `prod` | `prod` = progress display + URL list (details → `workspace/streamer.log`) · `dev` = full logs on stdout. Progress animates in place, `docker compose pull` style: a pinned summary header whose bar has one braille cell per folder rising with that folder's own progress, then one `- Waiting` → `⠸ Preparing` → `✔ Ready` row per folder with elapsed times. The image runs the streamer on its own pseudo-terminal, so it works under compose with no `tty:` line needed, and compose's `rtsp_streamer \|` log prefix stays intact on every line. |
+| `MODE` | `prod` | `prod` = progress display + URL list + runtime events (details → `workspace/streamer.log`) · `dev` = full logs on stdout. Progress animates in place, `docker compose pull` style: a pinned summary header whose bar has one braille cell per folder rising with that folder's real progress (encoded minutes, not just finished files), then one `- Waiting` → `⠸ Re-encoding` → `✔ Ready` row per folder with elapsed times. After the URLs, restarts and failures show up as timestamped lines above a pinned `● 70/70 publishing · up 18m` status line. The image runs the streamer on its own pseudo-terminal, so it works under compose with no `tty:` line needed, and compose's `rtsp_streamer \|` log prefix stays intact on every line. |
 | `ADVERTISE_IP` | auto | overrides `advertise_ip` from config |
 
 ### Ports
@@ -269,8 +269,9 @@ already make a restarted recorder resume its playlist correctly.
   most one keyframe interval (≤2 s) for a clean picture instead of spraying
   `reference picture missing during reorder` decode errors. By default
   (`camera_grade = false`) such sources are served **as-is** — no re-encode
-  on first run — and the banner lists them under "served as-is", grouped by
-  reason, since mid-stream joins may glitch. Flipping the setting rebuilds
+  on first run — and the banner paints their URLs red with a dim
+  `↳ served as-is: B-frames, long GOP` line underneath, since mid-stream
+  joins may glitch. Flipping the setting rebuilds
   the affected streams automatically.
 - **Damaged recordings repaired** — a source that lost a keyframe (common in
   camera recordings) would break hardware decoders every time the loop
@@ -314,7 +315,7 @@ Deep-dive documentation of every internal mechanism lives in
 | Tag | What |
 |---|---|
 | `latest` | the current release |
-| `X.Y.Z` (e.g. `2.10.1`) | pinned release versions |
+| `X.Y.Z` (e.g. `2.11.0`) | pinned release versions |
 
 Images are published by CI: pushing a `vX.Y.Z` tag runs the tests and the
 docker smoke test, and only if both pass pushes `X.Y.Z` + `latest`.

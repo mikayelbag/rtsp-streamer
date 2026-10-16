@@ -186,6 +186,94 @@ class TestDockerPullBlock(unittest.TestCase):
         self.assertIn("f0", plain[1])                    # active row kept
 
 
+class TestRealProgress(unittest.TestCase):
+    """Cells show work actually done, not a guess."""
+
+    def settle(self, n=60):
+        for t in range(n):                   # let the crawl reach its target
+            block = loader._frame(t, time.monotonic(), 80)
+        return block
+
+    def cell(self, block, i=0):
+        bar = re.search(r"\[(.*?)\]", ANSI.sub("", block[0])).group(1)
+        return loader.RISE.index(bar[i])
+
+    def test_half_encoded_video_fills_half_its_cell(self):
+        loader.set_items(["knife/k"])
+        loader.item_start("knife/k")
+        loader.item_progress("knife/k", 0.5)   # 15 of 30 min encoded
+        self.assertEqual(self.cell(self.settle()), 4)
+
+    def test_partial_counts_toward_folder_share(self):
+        loader.set_items(["a/1", "a/2", "a/3", "a/4"])
+        for n in ("a/1", "a/2"):
+            loader.item_start(n)
+            loader.item_done(n)
+        loader.item_start("a/3")
+        loader.item_progress("a/3", 0.5)       # 2.5 of 4 videos = 5 dots
+        self.assertEqual(self.cell(self.settle()), 5)
+
+    def test_reported_progress_never_creeps_past_itself(self):
+        loader.set_items(["a/1", "a/2"])
+        loader.item_start("a/1")
+        loader.item_progress("a/1", 0.0)       # reporting, but nothing done yet
+        self.assertEqual(self.cell(self.settle(200)), 0)
+
+    def test_unknown_progress_still_creeps_capped(self):
+        loader.set_items(["a/1", "a/2"])
+        loader.item_start("a/1")               # stream-copy: no reports
+        fill = self.cell(self.settle(400))
+        self.assertGreater(fill, 0)
+        self.assertLess(fill, 4)               # never claims its whole share
+
+    def test_progress_monotonic_and_below_done(self):
+        loader.set_items(["a/1"])
+        loader.item_start("a/1")
+        loader.item_progress("a/1", 0.8)
+        loader.item_progress("a/1", 0.1)       # second ffmpeg pass restarts at 0
+        self.assertEqual(loader._prog["a/1"], 0.8)
+        loader.item_progress("a/1", 1.0)
+        self.assertLess(loader._prog["a/1"], 1.0)   # only item_done completes
+
+
+class TestRowWording(unittest.TestCase):
+    def rows(self):
+        return [ANSI.sub("", l) for l in loader._frame(0, time.monotonic(), 80)]
+
+    def test_step_label_and_detail(self):
+        loader.set_items(["knife/k", "tfa/a", "tfa/b"])
+        loader.item_start("knife/k")
+        loader.item_step("knife/k", "Re-encoding", "broken chain")
+        loader.item_start("tfa/a")
+        loader.item_step("tfa/a", "Checking")
+        plain = self.rows()
+        self.assertIn("knife Re-encoding · broken chain", plain[1])
+        self.assertIn("tfa 0/2 Checking a", plain[2])
+
+    def test_ready_notes(self):
+        loader.set_items(["ids/a", "ids/b", "knife/k", "tfa/x", "tfa/y"])
+        for n, kind, why in (("ids/a", "cached", ""), ("ids/b", "cached", ""),
+                             ("knife/k", "reencoded", "broken chain"),
+                             ("tfa/x", "asis", ""), ("tfa/y", "cached", "")):
+            loader.item_start(n)
+            loader.item_note(n, kind, why)
+            loader.item_done(n)
+        plain = self.rows()
+        self.assertIn("ids Ready (2 videos) · cached", plain[1])
+        self.assertIn("knife Ready (1 video) · re-encoded: broken chain", plain[2])
+        self.assertIn("tfa Ready (2 videos) · 1 as-is", plain[3])
+
+    def test_brackets_and_words_stay_uncoloured(self):
+        loader.set_items(["a/1", "b/1"])
+        loader.item_start("a/1")
+        loader.item_done("a/1")
+        loader.item_start("b/1")
+        head = loader._frame(0, time.monotonic(), 80)[0]
+        self.assertIn(loader.DIM + "[" + loader.RESET, head)
+        self.assertNotIn(loader.CYAN + "Preparing", head)
+        self.assertIn(loader.BOLD + "rtsp-streamer" + loader.RESET, head)
+
+
 class TestPersistedFinalFrame(unittest.TestCase):
     """stop() leaves the finished block in scrollback like docker pull."""
 
