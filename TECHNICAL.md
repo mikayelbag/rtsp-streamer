@@ -6,7 +6,7 @@ written so that a junior engineer with no video-streaming background can
 follow along. The user-facing overview (quick start, config reference) lives
 in [`README.md`](README.md); this file is the "why and how" companion.
 
-Version covered: **2.12.0**.
+Version covered: **2.12.1**.
 
 ---
 

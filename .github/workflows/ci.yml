@@ -31,9 +31,8 @@ jobs:
       - name: Build image
         run: docker build -t rtsp-streamer:ci .
 
-      - name: Install ffmpeg (host-side probe)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-
+      # ffmpeg/ffprobe come from the image just built: no apt on the runner,
+      # whose package mirror can hang the job for its whole timeout.
       - name: Generate test video
         run: |
           mkdir -p video_samples/ids workspace config
@@ -41,10 +40,11 @@ jobs:
           # default the streamer serves sources as-is, and libx264's defaults
           # (bf=2, gop=250 -> one keyframe in the whole 6s clip) produce a stream
           # readers cannot decode across the -stream_loop seam.
-          ffmpeg -hide_banner -loglevel error -f lavfi -t 6 \
+          docker run --rm -v "$PWD/video_samples:/out" --entrypoint ffmpeg \
+            rtsp-streamer:ci -hide_banner -loglevel error -f lavfi -t 6 \
             -i testsrc2=size=640x360:rate=30 \
             -c:v libx264 -preset veryfast -pix_fmt yuv420p -bf 0 -g 30 \
-            video_samples/ids/smoke.mp4
+            /out/ids/smoke.mp4
 
       - name: Run container
         run: |
@@ -65,7 +65,8 @@ jobs:
           echo "RTSP port: $port"
           # retry: the port opens before the publisher is confirmed
           for i in $(seq 1 15); do
-            out=$(ffprobe -v error -rtsp_transport tcp -select_streams v:0 \
+            out=$(docker run --rm --network host --entrypoint ffprobe rtsp-streamer:ci \
+              -v error -rtsp_transport tcp -select_streams v:0 \
               -show_entries stream=codec_name,width,height -of csv=p=0 \
               "rtsp://127.0.0.1:${port}/ids/smoke" 2>/dev/null) && break
             sleep 2
@@ -78,7 +79,8 @@ jobs:
           port=$(cat workspace/.port)
           # timeout: on a broken stream ffmpeg's -t never accumulates and it
           # blocks forever — fail fast so the logs step below actually runs.
-          timeout 90 ffmpeg -hide_banner -v error -rtsp_transport tcp \
+          docker run --rm --network host --entrypoint timeout rtsp-streamer:ci \
+            90 ffmpeg -hide_banner -v error -rtsp_transport tcp \
             -i "rtsp://127.0.0.1:${port}/ids/smoke" -t 3 -f null - \
             || { echo "::error::frame pull failed or timed out"; exit 1; }
 

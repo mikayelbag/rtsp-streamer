@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RTSP streamer 2.12.0
+RTSP streamer 2.12.1
 
 Serves every video found under the videos folder as a looping live RTSP
 stream. For each stream this is the equivalent of:
@@ -79,7 +79,7 @@ import traceback
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "2.12.0"
+VERSION = "2.12.1"
 SIGNAL_FILE = "start"       # touch workspace/start to fire armed probe streams
 PORT_FILE = ".port"         # bound RTSP port, written for the Docker healthcheck
 X264_PRESET = "veryfast"
