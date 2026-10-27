@@ -265,13 +265,13 @@ already make a restarted recorder resume its playlist correctly.
   keyframe, and enough reference frames that NVDEC-based engines get a
   camera-sized decoder pool (no `No decoder surfaces left`). With
   `camera_grade = true` sources that don't already look like that are
-  re-encoded instead of served as-is, and a client joining mid-stream waits at
-  most one keyframe interval (≤2 s) for a clean picture instead of spraying
-  `reference picture missing during reorder` decode errors. By default
+  re-encoded instead of served as-is, so a client joining mid-stream waits at
+  most one keyframe interval (≤2 s) for its first picture and decodes without
+  B-frame reorder delay. By default
   (`camera_grade = false`) such sources are served **as-is** — no re-encode
   on first run — and the banner paints their URLs red with a dim
-  `↳ served as-is: B-frames, long GOP` line underneath, since mid-stream
-  joins may glitch. Flipping the setting rebuilds
+  `↳ served as-is: B-frames, long GOP` line underneath, since they don't
+  behave like a camera. Flipping the setting rebuilds
   the affected streams automatically.
 - **Damaged recordings repaired** — a source that lost a keyframe (common in
   camera recordings) would break hardware decoders every time the loop
@@ -293,6 +293,10 @@ already make a restarted recorder resume its playlist correctly.
   ffmpeg, blocked write) is caught too: the supervisor polls mediamtx's
   per-stream byte counters (API on localhost only) and restarts any live
   stream that has delivered nothing for 15 s.
+- **Clean joins** — like a real camera, every client starts on a keyframe:
+  the bundled mediamtx is patched so a reader that connects mid-GOP waits for
+  the next IDR instead of decoding broken P-frames (`Missing reference
+  picture` …). See TECHNICAL.md §11.1.
 - **Ready means ready** — the URL banner prints only after every stream is
   confirmed publishing on the server, so an engine pointed at the URLs
   connects on the first try.

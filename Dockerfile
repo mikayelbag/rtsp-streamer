@@ -1,13 +1,20 @@
-FROM alpine:3.20
+# mediamtx built from source with the keyframe gate (mediamtx-fork/): RTSP
+# readers start on an IDR like on a real camera, never mid-GOP.
+FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS mediamtx
 
 ARG MEDIAMTX_VERSION=1.12.2
 ARG TARGETARCH=amd64
 
+RUN apk add --no-cache git patch
+COPY mediamtx-fork/ /src/mediamtx-fork/
+RUN GOARCH="$TARGETARCH" /src/mediamtx-fork/build.sh "$MEDIAMTX_VERSION" /out/mediamtx
+
+FROM alpine:3.20
+
 # font-dejavu: the concat chain burns an index number into each video (drawtext)
-RUN apk add --no-cache python3 ffmpeg font-dejavu ca-certificates curl \
- && curl -fL "https://github.com/bluenviron/mediamtx/releases/download/v${MEDIAMTX_VERSION}/mediamtx_v${MEDIAMTX_VERSION}_linux_${TARGETARCH}.tar.gz" \
-    | tar -xz -C /usr/local/bin mediamtx \
- && apk del curl
+RUN apk add --no-cache python3 ffmpeg font-dejavu ca-certificates
+
+COPY --from=mediamtx /out/mediamtx /usr/local/bin/mediamtx
 
 # Baked defaults so docker-compose needs no environment block.
 #   MODE=prod            loader animation + URL list (dev = full logs on stdout)
@@ -47,7 +54,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 # OCI metadata — shows up on Docker Hub / `docker inspect`.
 LABEL org.opencontainers.image.title="RTSP Streamer" \
       org.opencontainers.image.description="Serve every video in a folder as a looping live RTSP stream — for benchmarking video-analytics engines. MediaMTX + ffmpeg, probe mode, mini-clip mode, concat chains, phase-shifted camera simulation." \
-      org.opencontainers.image.version="2.11.0" \
+      org.opencontainers.image.version="2.12.0" \
       org.opencontainers.image.licenses="MIT"
 
 ENTRYPOINT ["/app/entrypoint.sh"]

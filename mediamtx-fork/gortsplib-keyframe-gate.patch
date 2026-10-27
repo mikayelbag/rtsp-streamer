@@ -1,0 +1,422 @@
+diff --git a/server_stream.go b/server_stream.go
+index 574d112..bb8c8f9 100644
+--- a/server_stream.go
++++ b/server_stream.go
+@@ -211,8 +211,14 @@ func (st *ServerStream) rtpInfoEntry(medi *description.Media, now time.Time) *he
+ 		return nil
+ 	}
+ 
+-	// sequence number of the first packet of the stream
+-	seqNum := stats.LastSequenceNumber + 1
++	// sequence number of the first packet of the stream.
++	// Omitted when the format is keyframe-gated: the first packet the reader
++	// gets is the start of the next random access unit, not the next packet.
++	var seqNumPtr *uint16
++	if format.gate == nil {
++		seqNum := stats.LastSequenceNumber + 1
++		seqNumPtr = &seqNum
++	}
+ 
+ 	// RTP timestamp corresponding to the time value in
+ 	// the Range response header.
+@@ -222,7 +228,7 @@ func (st *ServerStream) rtpInfoEntry(medi *description.Media, now time.Time) *he
+ 		uint64(clockRate)/10)
+ 
+ 	return &headers.RTPInfoEntry{
+-		SequenceNumber: &seqNum,
++		SequenceNumber: seqNumPtr,
+ 		Timestamp:      &ts,
+ 	}
+ }
+@@ -283,6 +289,7 @@ func (st *ServerStream) readerRemove(ss *ServerSession) {
+ 	}
+ 
+ 	delete(st.readers, ss)
++	st.readerStopGates(ss)
+ 
+ 	if *ss.setuppedTransport == TransportUDPMulticast {
+ 		st.multicastReaderCount--
+@@ -329,6 +336,16 @@ func (st *ServerStream) readerSetInactive(ss *ServerSession) {
+ 		}
+ 	} else {
+ 		delete(st.activeUnicastReaders, ss)
++		st.readerStopGates(ss)
++	}
++}
++
++// readerStopGates makes a reader that plays again wait for a keyframe.
++func (st *ServerStream) readerStopGates(ss *ServerSession) {
++	for _, sm := range st.medias {
++		for _, sf := range sm.formats {
++			sf.readerStop(ss)
++		}
+ 	}
+ }
+ 
+diff --git a/server_stream_format.go b/server_stream_format.go
+index 0498ae5..28d89a8 100644
+--- a/server_stream_format.go
++++ b/server_stream_format.go
+@@ -1,6 +1,7 @@
+ package gortsplib
+ 
+ import (
++	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -17,10 +18,13 @@ type serverStreamFormat struct {
+ 
+ 	rtcpSender     *rtcpsender.RTCPSender
+ 	rtpPacketsSent *uint64
++	gate           *keyframeGate
++	gateMutex      sync.Mutex
+ }
+ 
+ func (sf *serverStreamFormat) initialize() {
+ 	sf.rtpPacketsSent = new(uint64)
++	sf.gate = newKeyframeGate(sf.format)
+ 
+ 	sf.rtcpSender = &rtcpsender.RTCPSender{
+ 		ClockRate: sf.format.ClockRate(),
+@@ -38,19 +42,23 @@ func (sf *serverStreamFormat) initialize() {
+ func (sf *serverStreamFormat) writePacketRTP(byts []byte, pkt *rtp.Packet, ntp time.Time) error {
+ 	sf.rtcpSender.ProcessPacket(pkt, ntp, sf.format.PTSEqualsDTS(pkt))
+ 
+-	le := uint64(len(byts))
++	if sf.gate != nil {
++		sf.writePacketRTPGated(byts, pkt)
++	} else {
++		le := uint64(len(byts))
+ 
+-	// send unicast
+-	for r := range sf.sm.st.activeUnicastReaders {
+-		if _, ok := r.setuppedMedias[sf.sm.media]; ok {
+-			err := r.writePacketRTP(sf.sm.media, pkt.PayloadType, byts)
+-			if err != nil {
+-				r.onStreamWriteError(err)
+-				continue
+-			}
++		// send unicast
++		for r := range sf.sm.st.activeUnicastReaders {
++			if _, ok := r.setuppedMedias[sf.sm.media]; ok {
++				err := r.writePacketRTP(sf.sm.media, pkt.PayloadType, byts)
++				if err != nil {
++					r.onStreamWriteError(err)
++					continue
++				}
+ 
+-			atomic.AddUint64(sf.sm.bytesSent, le)
+-			atomic.AddUint64(sf.rtpPacketsSent, 1)
++				atomic.AddUint64(sf.sm.bytesSent, le)
++				atomic.AddUint64(sf.rtpPacketsSent, 1)
++			}
+ 		}
+ 	}
+ 
+@@ -61,9 +69,53 @@ func (sf *serverStreamFormat) writePacketRTP(byts []byte, pkt *rtp.Packet, ntp t
+ 			return err
+ 		}
+ 
+-		atomic.AddUint64(sf.sm.bytesSent, le)
++		atomic.AddUint64(sf.sm.bytesSent, uint64(len(byts)))
+ 		atomic.AddUint64(sf.rtpPacketsSent, 1)
+ 	}
+ 
+ 	return nil
+ }
++
++// writePacketRTPGated sends a packet to the unicast readers that already
++// started, and starts the waiting ones on the first packet of a random access
++// unit (see keyframeGate).
++func (sf *serverStreamFormat) writePacketRTPGated(byts []byte, pkt *rtp.Packet) {
++	sf.gateMutex.Lock()
++	defer sf.gateMutex.Unlock()
++
++	randomAccess := sf.gate.process(byts, pkt)
++
++	for r := range sf.sm.st.activeUnicastReaders {
++		if _, ok := r.setuppedMedias[sf.sm.media]; !ok {
++			continue
++		}
++
++		var toSend [][]byte
++		if _, ok := sf.gate.started[r]; ok {
++			toSend = [][]byte{byts}
++		} else if randomAccess {
++			toSend = sf.gate.auPackets
++			sf.gate.started[r] = struct{}{}
++		}
++
++		for _, b := range toSend {
++			err := r.writePacketRTP(sf.sm.media, pkt.PayloadType, b)
++			if err != nil {
++				r.onStreamWriteError(err)
++				delete(sf.gate.started, r)
++				break
++			}
++
++			atomic.AddUint64(sf.sm.bytesSent, uint64(len(b)))
++			atomic.AddUint64(sf.rtpPacketsSent, 1)
++		}
++	}
++}
++
++func (sf *serverStreamFormat) readerStop(ss *ServerSession) {
++	if sf.gate != nil {
++		sf.gateMutex.Lock()
++		delete(sf.gate.started, ss)
++		sf.gateMutex.Unlock()
++	}
++}
+diff --git a/server_stream_keyframe_gate.go b/server_stream_keyframe_gate.go
+new file mode 100644
+index 0000000..7741392
+--- /dev/null
++++ b/server_stream_keyframe_gate.go
+@@ -0,0 +1,137 @@
++package gortsplib
++
++import (
++	"github.com/pion/rtp"
++
++	"github.com/bluenviron/gortsplib/v4/pkg/format"
++)
++
++// keyframeGate holds back an H264/H265 format from each unicast reader until
++// the reader can start decoding cleanly: delivery begins with the first
++// access unit that contains an IDR (H265: IDR or CRA) slice, including the
++// parameter sets and SEI that precede the slice in that unit.
++//
++// Without it a reader that joins mid-GOP receives P-frames whose reference
++// pictures it never saw ("Missing reference picture", corrupt macroblocks
++// until the next keyframe). A reader that loses a packet on a full write
++// queue is gated again, so a truncated frame is followed by a gap instead of
++// a corrupt run up to the next keyframe.
++type keyframeGate struct {
++	isRandomAccess func(payload []byte) bool
++
++	// packets of the current access unit, buffered until its first random
++	// access slice is seen
++	auPackets   [][]byte
++	auTimestamp uint32
++	auRandom    bool
++	prevMarker  bool
++	seenPacket  bool
++
++	started map[*ServerSession]struct{}
++}
++
++func newKeyframeGate(forma format.Format) *keyframeGate {
++	switch forma.(type) {
++	case *format.H264:
++		return &keyframeGate{
++			isRandomAccess: h264PacketIsRandomAccess,
++			started:        make(map[*ServerSession]struct{}),
++		}
++
++	case *format.H265:
++		return &keyframeGate{
++			isRandomAccess: h265PacketIsRandomAccess,
++			started:        make(map[*ServerSession]struct{}),
++		}
++	}
++
++	return nil
++}
++
++// process updates the access unit state with a packet and reports whether
++// this packet carries the first random access slice of its access unit, in
++// which case waiting readers must receive gate.auPackets (which ends with
++// this packet).
++func (g *keyframeGate) process(byts []byte, pkt *rtp.Packet) bool {
++	if !g.seenPacket || g.prevMarker || pkt.Timestamp != g.auTimestamp {
++		g.auPackets = g.auPackets[:0]
++		g.auTimestamp = pkt.Timestamp
++		g.auRandom = false
++		g.seenPacket = true
++	}
++	g.prevMarker = pkt.Marker
++
++	if g.auRandom {
++		return false
++	}
++
++	g.auPackets = append(g.auPackets, byts)
++
++	if g.isRandomAccess(pkt.Payload) {
++		g.auRandom = true
++		return true
++	}
++
++	return false
++}
++
++func h264PacketIsRandomAccess(payload []byte) bool {
++	if len(payload) < 1 {
++		return false
++	}
++
++	switch typ := payload[0] & 0x1F; {
++	case typ == 5: // IDR
++		return true
++
++	case typ == 24: // STAP-A
++		for buf := payload[1:]; len(buf) >= 3; {
++			size := int(buf[0])<<8 | int(buf[1])
++			if size == 0 || len(buf) < 2+size {
++				return false
++			}
++			if buf[2]&0x1F == 5 {
++				return true
++			}
++			buf = buf[2+size:]
++		}
++
++	case typ == 28 || typ == 29: // FU-A, FU-B
++		return len(payload) >= 2 && payload[1]&0x80 != 0 && payload[1]&0x1F == 5
++	}
++
++	return false
++}
++
++func h265IsRandomAccessType(typ byte) bool {
++	// IDR_W_RADL, IDR_N_LP, CRA_NUT, like mediacommon's h265.IsRandomAccess
++	return typ == 19 || typ == 20 || typ == 21
++}
++
++func h265PacketIsRandomAccess(payload []byte) bool {
++	if len(payload) < 2 {
++		return false
++	}
++
++	switch typ := (payload[0] >> 1) & 0x3F; {
++	case typ < 48:
++		return h265IsRandomAccessType(typ)
++
++	case typ == 48: // aggregation packet
++		for buf := payload[2:]; len(buf) >= 4; {
++			size := int(buf[0])<<8 | int(buf[1])
++			if size < 2 || len(buf) < 2+size {
++				return false
++			}
++			if h265IsRandomAccessType((buf[2] >> 1) & 0x3F) {
++				return true
++			}
++			buf = buf[2+size:]
++		}
++
++	case typ == 49: // fragmentation unit
++		return len(payload) >= 3 && payload[2]&0x80 != 0 && h265IsRandomAccessType(payload[2]&0x3F)
++	}
++
++	return false
++}
+diff --git a/server_stream_keyframe_gate_test.go b/server_stream_keyframe_gate_test.go
+new file mode 100644
+index 0000000..d685b36
+--- /dev/null
++++ b/server_stream_keyframe_gate_test.go
+@@ -0,0 +1,102 @@
++package gortsplib
++
++import (
++	"testing"
++
++	"github.com/pion/rtp"
++	"github.com/stretchr/testify/require"
++
++	"github.com/bluenviron/gortsplib/v4/pkg/format"
++)
++
++func TestH264PacketIsRandomAccess(t *testing.T) {
++	for _, ca := range []struct {
++		name    string
++		payload []byte
++		ok      bool
++	}{
++		{"idr", []byte{0x65, 0x88}, true},
++		{"non-idr", []byte{0x41, 0x9a}, false},
++		{"sps", []byte{0x67, 0x64}, false},
++		{"stap-a sps pps idr", []byte{0x78, 0, 2, 0x67, 0x64, 0, 2, 0x68, 0xee, 0, 2, 0x65, 0x88}, true},
++		{"stap-a sps pps", []byte{0x78, 0, 2, 0x67, 0x64, 0, 2, 0x68, 0xee}, false},
++		{"stap-a truncated", []byte{0x78, 0, 9, 0x65}, false},
++		{"fu-a idr start", []byte{0x7c, 0x85, 0x88}, true},
++		{"fu-a idr middle", []byte{0x7c, 0x05, 0x88}, false},
++		{"fu-a non-idr start", []byte{0x5c, 0x81, 0x9a}, false},
++		{"empty", nil, false},
++	} {
++		t.Run(ca.name, func(t *testing.T) {
++			require.Equal(t, ca.ok, h264PacketIsRandomAccess(ca.payload))
++		})
++	}
++}
++
++func TestH265PacketIsRandomAccess(t *testing.T) {
++	for _, ca := range []struct {
++		name    string
++		payload []byte
++		ok      bool
++	}{
++		{"idr_w_radl", []byte{19 << 1, 1, 0xaf}, true},
++		{"idr_n_lp", []byte{20 << 1, 1, 0xaf}, true},
++		{"cra", []byte{21 << 1, 1, 0xaf}, true},
++		{"trail_r", []byte{1 << 1, 1, 0xaf}, false},
++		{"vps", []byte{32 << 1, 1, 0x0c}, false},
++		{"ap vps idr", []byte{48 << 1, 1, 0, 3, 32 << 1, 1, 0x0c, 0, 3, 19 << 1, 1, 0xaf}, true},
++		{"ap vps sps", []byte{48 << 1, 1, 0, 3, 32 << 1, 1, 0x0c, 0, 3, 33 << 1, 1, 0x01}, false},
++		{"fu idr start", []byte{49 << 1, 1, 0x80 | 19, 0xaf}, true},
++		{"fu idr middle", []byte{49 << 1, 1, 19, 0xaf}, false},
++		{"fu trail start", []byte{49 << 1, 1, 0x80 | 1, 0xaf}, false},
++		{"short", []byte{19 << 1}, false},
++	} {
++		t.Run(ca.name, func(t *testing.T) {
++			require.Equal(t, ca.ok, h265PacketIsRandomAccess(ca.payload))
++		})
++	}
++}
++
++func TestKeyframeGateNotForOtherFormats(t *testing.T) {
++	require.Nil(t, newKeyframeGate(&format.MPEG4Audio{}))
++	require.NotNil(t, newKeyframeGate(&format.H264{}))
++	require.NotNil(t, newKeyframeGate(&format.H265{}))
++}
++
++func TestKeyframeGateProcess(t *testing.T) {
++	g := newKeyframeGate(&format.H264{})
++
++	pkt := func(ts uint32, marker bool, payload ...byte) ([]byte, *rtp.Packet) {
++		return payload, &rtp.Packet{
++			Header:  rtp.Header{Timestamp: ts, Marker: marker},
++			Payload: payload,
++		}
++	}
++
++	// P-frame unit: never opens
++	require.False(t, g.process(pkt(100, true, 0x41, 1)))
++
++	// keyframe unit: AUD, SPS, PPS, then the IDR in two FU-A fragments
++	b1, p1 := pkt(200, false, 0x09, 0xf0)
++	b2, p2 := pkt(200, false, 0x67, 0x64)
++	b3, p3 := pkt(200, false, 0x68, 0xee)
++	b4, p4 := pkt(200, false, 0x7c, 0x85, 0x88)
++	b5, p5 := pkt(200, true, 0x7c, 0x45, 0x88)
++	require.False(t, g.process(b1, p1))
++	require.False(t, g.process(b2, p2))
++	require.False(t, g.process(b3, p3))
++	require.True(t, g.process(b4, p4))
++	require.Equal(t, [][]byte{b1, b2, b3, b4}, g.auPackets)
++	require.False(t, g.process(b5, p5))
++
++	// next unit starts fresh even with the same timestamp after a marker
++	b6, p6 := pkt(200, true, 0x65, 0x88)
++	require.True(t, g.process(b6, p6))
++	require.Equal(t, [][]byte{b6}, g.auPackets)
++
++	// timestamp change without marker also starts a new unit
++	b7, p7 := pkt(300, false, 0x41, 1)
++	b8, p8 := pkt(400, true, 0x65, 0x88)
++	require.False(t, g.process(b7, p7))
++	require.True(t, g.process(b8, p8))
++	require.Equal(t, [][]byte{b8}, g.auPackets)
++}

@@ -6,7 +6,7 @@ written so that a junior engineer with no video-streaming background can
 follow along. The user-facing overview (quick start, config reference) lives
 in [`README.md`](README.md); this file is the "why and how" companion.
 
-Version covered: **2.11.0**.
+Version covered: **2.12.0**.
 
 ---
 
@@ -625,6 +625,39 @@ The interesting keys:
 | `paths: all_others:` | The catch-all path: accept any publisher on any path. Access control is not this tool's job (test-LAN scope, see README security note). |
 | `api: yes` + `apiAddress: 127.0.0.1:<port+2000>` | The control API that feeds the readiness wait (§6) and the delivery watchdog (§12). Bound to loopback only — invisible off-host. If no port near `+2000` is free the API is disabled and the watchdog silently turns off. |
 | everything else `no` | Metrics, HLS, WebRTC, SRT, RTMP all disabled — smallest possible surface. |
+
+### 11.1 The keyframe gate (patched mediamtx, 2.12.0)
+
+Stock mediamtx relays packets live: a reader that connects mid-GOP gets
+P-frames whose reference pictures it never saw. FFmpeg-based engines log
+`Missing reference picture, default is N`, `illegal short term buffer state
+detected`, `decode_slice_header error`, NVDEC `hardware accelerator failed
+to decode picture`, and decode garbage (or nothing) until the next keyframe —
+up to `keyint` frames, or a whole 4 s GOP on an as-is source. A real camera
+starts each RTSP session on an IDR, which is why the same engine is clean
+there.
+
+The image therefore runs mediamtx built from source by
+`mediamtx-fork/build.sh`, which applies `gortsplib-keyframe-gate.patch` to
+the gortsplib version the release pins (`mediamtx --version` prints
+`v1.12.2-keyframegate`). The fan-out to each unicast reader (gortsplib's
+`ServerStream`) gains a per-format gate for H.264/H.265:
+
+- the current access unit's packets are buffered until its first IDR (H.265:
+  IDR or CRA) slice is seen — in single-NAL, aggregation (STAP-A / AP) and
+  fragmented (FU-A / FU) packets;
+- a waiting reader is released with that whole unit, parameter sets and SEI
+  that precede the slice included, then gets every packet after it;
+- a reader whose write queue overflows (mediamtx's "reader is too slow")
+  loses a packet, so its frame is truncated (`error while decoding MB …,
+  bytestream -N`); it is gated again and resumes at the next IDR — a gap
+  instead of a corrupt run;
+- PAUSE/PLAY re-gates; RTP-Info omits `seq` for gated formats, since the
+  first packet a reader gets is no longer the next one on the stream.
+
+Other formats, multicast and non-RTSP readers are untouched. Cost: a joining
+reader waits up to one keyframe interval for its first picture, like a
+camera that doesn't force an IDR on connect.
 
 ---
 

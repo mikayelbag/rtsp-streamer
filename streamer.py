@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RTSP streamer 2.11.0
+RTSP streamer 2.12.0
 
 Serves every video found under the videos folder as a looping live RTSP
 stream. For each stream this is the equivalent of:
@@ -79,7 +79,7 @@ import traceback
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "2.11.0"
+VERSION = "2.12.0"
 SIGNAL_FILE = "start"       # touch workspace/start to fire armed probe streams
 PORT_FILE = ".port"         # bound RTSP port, written for the Docker healthcheck
 X264_PRESET = "veryfast"
@@ -1614,8 +1614,8 @@ def banner_lines(base, port, transport, pub_mounts, feeder_mounts,
     foot = []
     if any(w for _, w in pub_mounts):
         foot += [paint(DIM, l) for l in textwrap.wrap(
-            "↳ as-is streams: clients joining mid-stream see decode errors "
-            "until the next keyframe. camera_grade = true re-encodes them.",
+            "↳ as-is streams: not camera-like (slower joins, B-frame decode "
+            "delay). camera_grade = true re-encodes them.",
             BANNER_W - 2, initial_indent="  ", subsequent_indent="    ",
             break_on_hyphens=False)]
         foot.append("")
